@@ -207,21 +207,31 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 	it = JsonbIteratorInit(&((Jsonb *) data)->root);
 	while ((r = JsonbIteratorNext(&it, &v, false)) != 0)
 	{
-		if (r == WJB_KEY)
+		switch (r)
 		{
-			int					len;
-			int32				key_id;
-			unsigned char	   *ptr = palloc0(6);
+			case WJB_BEGIN_OBJECT:
+				break;
+			case WJB_KEY:
+			{
+				int					len;
+				int32				key_id;
+				unsigned char	   *ptr = palloc0(6);
 
-			Assert(v.type == jbvString);
-			key_id = get_key_id(ac->cmoptoid, v.val.string.val, v.val.string.len);
+				Assert(v.type == jbvString);
+				key_id = get_key_id(ac->cmoptoid, v.val.string.val, v.val.string.len);
 
-			encode_varbyte(key_id, ptr, &len);
-			Assert(len <= 5);
+				encode_varbyte(key_id, ptr, &len);
+				Assert(len <= 5);
 
-			v.type = jbvString;
-			v.val.string.val = (char *) ptr;
-			v.val.string.len = len;
+				v.type = jbvString;
+				v.val.string.val = (char *) ptr;
+				v.val.string.len = len;
+				break;
+			}
+			case WJB_END_OBJECT:
+				break;
+			default:
+				break;
 		}
 		jbv = pushJsonbValue(&state, r, r < WJB_BEGIN_ARRAY ? &v : NULL);
 	}
