@@ -16,54 +16,74 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(jsonbc_compression_handler);
 PG_FUNCTION_INFO_V1(int4_to_char);
 
-static MemoryContext compression_mcxt = NULL;
-
-static uint32
-get_key_id(Oid cmoptoid, char *key, int keylen)
+/* we use one buffer for whole transaction to avoid extra allocations */
+typedef struct
 {
-	uint32		key_id = 0;
-	char	   *s,
-			   *sql;
-	bool		isnull;
-	Datum		datum;
+	char	   *buf;		/* keys */
+	int			buflen;
+	uint32	   *idsbuf;		/* key ids */
+	int			idslen;
+} CompressionThroughBuffers;
 
-	s = palloc(keylen + 1);
-	memcpy(s, key, keylen);
-	s[keylen] = '\0';
+static MemoryContext compression_mcxt = NULL;
+static CompressionThroughBuffers *compression_buffers = NULL;
 
-	sql = psprintf("SELECT id FROM jsonbc_dictionary WHERE cmopt = %d"
-				"	AND key = '%s'", cmoptoid, s);
+static void init_memory_context(void);
+static void memory_reset_callback(void *arg);
+static void get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys);
+static char *get_key_by_id(Oid cmoptoid, int32 key_id);
+static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
+static uint32 decode_varbyte(unsigned char *ptr);
+static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
+
+/* TODO: change to worker, add caches and other stuff */
+static void
+get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
+{
+	int		i;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 
-	if (SPI_exec(sql, 0) != SPI_OK_SELECT)
-		elog(ERROR, "SPI_exec failed");
-
-	if (SPI_processed == 0)
+	for (i = 0; i < nkeys; i++)
 	{
-		char *sql2 = psprintf("with t as (select (coalesce(max(id), 0) + 1) new_id from "
-					"jsonbc_dictionary where cmopt = %d) insert into jsonbc_dictionary"
-					" select %d, t.new_id, '%s' from t returning id", cmoptoid, cmoptoid, s);
+		Datum		datum;
+		bool		isnull;
+		char	   *sql;
 
-		if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
+		sql = psprintf("SELECT id FROM jsonbc_dictionary WHERE cmopt = %d"
+					   "	AND key = '%s'", cmoptoid, buf);
+
+		if (SPI_exec(sql, 0) != SPI_OK_SELECT)
 			elog(ERROR, "SPI_exec failed");
+
+		if (SPI_processed == 0)
+		{
+			char *sql2 = psprintf("with t as (select (coalesce(max(id), 0) + 1) new_id from "
+						"jsonbc_dictionary where cmopt = %d) insert into jsonbc_dictionary"
+						" select %d, t.new_id, '%s' from t returning id", cmoptoid, cmoptoid, buf);
+
+			if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
+				elog(ERROR, "SPI_exec failed");
+		}
+
+		datum = SPI_getbinval(SPI_tuptable->vals[0],
+							  SPI_tuptable->tupdesc,
+							  1,
+							  &isnull);
+		if (isnull)
+			elog(ERROR, "id is NULL");
+
+		idsbuf[i] = DatumGetInt32(datum);
+
+		/* move to next key */
+		while (*buf != '\0')
+			buf++;
+
+		buf++;
+		pfree(sql);
 	}
-
-	datum = SPI_getbinval(SPI_tuptable->vals[0],
-						  SPI_tuptable->tupdesc,
-						  1,
-						  &isnull);
-	if (isnull)
-		elog(ERROR, "id is NULL");
-
-	key_id = DatumGetInt32(datum);
-
-	pfree(s);
-	pfree(sql);
 	SPI_finish();
-
-	return key_id;
 }
 
 static char *
@@ -158,6 +178,41 @@ decode_varbyte(unsigned char *ptr)
 	return val;
 }
 
+static void
+init_memory_context(void)
+{
+	MemoryContext			old_mcxt;
+	MemoryContextCallback  *cb;
+
+	if (compression_mcxt)
+		return;
+
+	compression_mcxt = AllocSetContextCreate(TopTransactionContext,
+											 "jsonbc compression context",
+											 ALLOCSET_DEFAULT_SIZES);
+	cb = MemoryContextAlloc(TopTransactionContext,
+							sizeof(MemoryContextCallback));
+	cb->func = memory_reset_callback;
+	cb->arg = NULL;
+
+	MemoryContextRegisterResetCallback(TopTransactionContext, cb);
+
+	old_mcxt = MemoryContextSwitchTo(compression_mcxt);
+	compression_buffers = palloc(sizeof(CompressionThroughBuffers));
+	compression_buffers->buflen = 1024;
+	compression_buffers->idslen = 256;
+	compression_buffers->buf = palloc(compression_buffers->buflen);
+	compression_buffers->idsbuf =
+			(uint32 *) palloc(compression_buffers->idslen * sizeof(uint32));
+	MemoryContextSwitchTo(old_mcxt);
+}
+
+static void
+memory_reset_callback(void *arg)
+{
+	compression_mcxt = NULL;
+}
+
 /*
  * Given a JsonbValue, convert to Jsonb but with different header part.
  * The result is palloc'd.
@@ -198,42 +253,84 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 {
 	int					size;
 	JsonbIteratorToken	r;
-	JsonbValue			v;
+	JsonbValue			jv;
 	JsonbIterator	   *it;
 	JsonbValue		   *jbv = NULL;
 	JsonbParseState	   *state = NULL;
 	struct varlena	   *res;
 
+	init_memory_context();
+
 	it = JsonbIteratorInit(&((Jsonb *) data)->root);
-	while ((r = JsonbIteratorNext(&it, &v, false)) != 0)
+	while ((r = JsonbIteratorNext(&it, &jv, false)) != 0)
 	{
-		switch (r)
+		/* we assume that jsonb has already been sorted and uniquefied */
+		jbv = pushJsonbValue(&state, r, r < WJB_BEGIN_ARRAY ? &jv : NULL);
+
+		if (r == WJB_END_OBJECT && jbv->type == jbvObject)
 		{
-			case WJB_BEGIN_OBJECT:
-				break;
-			case WJB_KEY:
+			int		i,
+					len,
+					nkeys = jbv->val.object.nPairs,
+					offset = 0;
+
+			/* maximum length of encoded uint32 is 5 */
+			char   *keyptr = MemoryContextAlloc(compression_mcxt, nkeys * 5),
+				   *buf;
+			uint32 *idsbuf;
+
+			/* increase the size of buffer for key ids if we need to */
+			if (nkeys > compression_buffers->idslen)
 			{
-				int					len;
-				int32				key_id;
-				unsigned char	   *ptr = palloc0(6);
-
-				Assert(v.type == jbvString);
-				key_id = get_key_id(ac->cmoptoid, v.val.string.val, v.val.string.len);
-
-				encode_varbyte(key_id, ptr, &len);
-				Assert(len <= 5);
-
-				v.type = jbvString;
-				v.val.string.val = (char *) ptr;
-				v.val.string.len = len;
-				break;
+				compression_buffers->idsbuf =
+					(uint32 *) repalloc(compression_buffers->idsbuf, nkeys * sizeof(uint32));
+				compression_buffers->idslen = nkeys;
 			}
-			case WJB_END_OBJECT:
-				break;
-			default:
-				break;
+
+			/* calculate length of keys */
+			len = 0;
+			for (i = 0; i < nkeys; i++)
+			{
+				JsonbValue *v = &jbv->val.object.pairs[i].key;
+				len += v->val.string.len + 1 /* \0 */;
+			}
+
+			/* increase the buffer if we need to */
+			if (len > compression_buffers->buflen)
+			{
+				compression_buffers->buf =
+					(char *) repalloc(compression_buffers->buf, len);
+				compression_buffers->buflen = len;
+			}
+
+			/* copy all keys to buffer */
+			buf = compression_buffers->buf;
+			idsbuf = compression_buffers->idsbuf;
+
+			for (i = 0; i < nkeys; i++)
+			{
+				JsonbValue *v = &jbv->val.object.pairs[i].key;
+				memcpy(buf + offset, v->val.string.val, v->val.string.len);
+				offset += v->val.string.len;
+				buf[offset++] = '\0';
+			}
+
+			Assert(offset == len);
+
+			/* retrieve or generate ids */
+			get_key_ids(ac->cmoptoid, buf, idsbuf, nkeys);
+
+			/* replace the old keys with encoded ids */
+			for (i = 0; i < nkeys; i++)
+			{
+				JsonbValue *v = &jbv->val.object.pairs[i].key;
+
+				encode_varbyte(idsbuf[i], (unsigned char *) keyptr, &len);
+				v->val.string.val = keyptr;
+				v->val.string.len = len;
+				keyptr += len;
+			}
 		}
-		jbv = pushJsonbValue(&state, r, r < WJB_BEGIN_ARRAY ? &v : NULL);
 	}
 
 	/* don't compress scalar values */
@@ -263,7 +360,7 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 	JsonbParseState	   *state = NULL;
 	struct varlena	   *res;
 
-	Assert(compression_mcxt != NULL);
+	init_memory_context();
 	Assert(VARATT_IS_CUSTOM_COMPRESSED(data));
 
 	jb = (Jsonb *) ((char *) data + VARHDRSZ_CUSTOM_COMPRESSED - offsetof(Jsonb, root));
@@ -286,7 +383,6 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 	}
 
 	res = (struct varlena *) JsonbValueToJsonb(jbv);
-	MemoryContextReset(compression_mcxt);
 	return res;
 }
 
@@ -305,11 +401,6 @@ jsonbc_compression_handler(PG_FUNCTION_ARGS)
 	cmr->drop = NULL;
 	cmr->compress = jsonbc_compress;
 	cmr->decompress = jsonbc_decompress;
-
-	if (compression_mcxt == NULL)
-		compression_mcxt = AllocSetContextCreate(TopTransactionContext,
-												 "jsonbc compression context",
-												 ALLOCSET_DEFAULT_SIZES);
 
 	PG_RETURN_POINTER(cmr);
 }
