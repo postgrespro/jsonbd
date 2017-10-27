@@ -7,7 +7,7 @@ EXTENSION = jsonbc
 DATA = jsonbc--0.1.sql
 PGFILEDESC = "jsonbc - jsonb compression method"
 
-REGRESS = jsonbc
+REGRESS = basic
 
 ifdef USE_PGXS
 ifndef PG_CONFIG

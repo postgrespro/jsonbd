@@ -4,13 +4,21 @@
 #include "fmgr.h"
 
 #include "access/compression.h"
+#include "access/htup_details.h"
+#include "access/sysattr.h"
+#include "access/xact.h"
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_type.h"
+#include "catalog/indexing.h"
+#include "commands/extension.h"
+#include "executor/spi.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/jsonb.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_crc.h"
-#include "executor/spi.h"
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(jsonbc_compression_handler);
@@ -23,24 +31,28 @@ typedef struct
 	int			buflen;
 	uint32	   *idsbuf;		/* key ids */
 	int			idslen;
+
+	MemoryContext	item_mcxt;
 } CompressionThroughBuffers;
 
 static MemoryContext compression_mcxt = NULL;
 static CompressionThroughBuffers *compression_buffers = NULL;
 
-static void init_memory_context(void);
+static void init_memory_context(bool);
 static void memory_reset_callback(void *arg);
 static void get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys);
 static char *get_key_by_id(Oid cmoptoid, int32 key_id);
 static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
 static uint32 decode_varbyte(unsigned char *ptr);
 static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
+static Oid get_extension_schema(void);
 
 /* TODO: change to worker, add caches and other stuff */
 static void
 get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 {
 	int		i;
+	char   *nspc = get_namespace_name(get_extension_schema());
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
@@ -51,8 +63,8 @@ get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		bool		isnull;
 		char	   *sql;
 
-		sql = psprintf("SELECT id FROM jsonbc_dictionary WHERE cmopt = %d"
-					   "	AND key = '%s'", cmoptoid, buf);
+		sql = psprintf("SELECT id FROM %s.jsonbc_dictionary WHERE cmopt = %d"
+					   "	AND key = '%s'", nspc, cmoptoid, buf);
 
 		if (SPI_exec(sql, 0) != SPI_OK_SELECT)
 			elog(ERROR, "SPI_exec failed");
@@ -60,8 +72,9 @@ get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		if (SPI_processed == 0)
 		{
 			char *sql2 = psprintf("with t as (select (coalesce(max(id), 0) + 1) new_id from "
-						"jsonbc_dictionary where cmopt = %d) insert into jsonbc_dictionary"
-						" select %d, t.new_id, '%s' from t returning id", cmoptoid, cmoptoid, buf);
+						"%s.jsonbc_dictionary where cmopt = %d) insert into %s.jsonbc_dictionary"
+						" select %d, t.new_id, '%s' from t returning id",
+						nspc, cmoptoid, nspc, cmoptoid, buf);
 
 			if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
 				elog(ERROR, "SPI_exec failed");
@@ -91,9 +104,10 @@ get_key_by_id(Oid cmoptoid, int32 key_id)
 {
 	MemoryContext	old_mcxt;
 
+	char *nspc = get_namespace_name(get_extension_schema());
 	char *res = NULL;
-	char *sql = psprintf("SELECT key FROM jsonbc_dictionary WHERE cmopt = %d"
-				"	AND id = %d", cmoptoid, key_id);
+	char *sql = psprintf("SELECT key FROM %s.jsonbc_dictionary WHERE cmopt = %d"
+				"	AND id = %d", nspc, cmoptoid, key_id);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
@@ -179,7 +193,7 @@ decode_varbyte(unsigned char *ptr)
 }
 
 static void
-init_memory_context(void)
+init_memory_context(bool init_buffers)
 {
 	MemoryContext			old_mcxt;
 	MemoryContextCallback  *cb;
@@ -197,14 +211,21 @@ init_memory_context(void)
 
 	MemoryContextRegisterResetCallback(TopTransactionContext, cb);
 
-	old_mcxt = MemoryContextSwitchTo(compression_mcxt);
-	compression_buffers = palloc(sizeof(CompressionThroughBuffers));
-	compression_buffers->buflen = 1024;
-	compression_buffers->idslen = 256;
-	compression_buffers->buf = palloc(compression_buffers->buflen);
-	compression_buffers->idsbuf =
-			(uint32 *) palloc(compression_buffers->idslen * sizeof(uint32));
-	MemoryContextSwitchTo(old_mcxt);
+	if (init_buffers)
+	{
+		old_mcxt = MemoryContextSwitchTo(compression_mcxt);
+		compression_buffers = palloc(sizeof(CompressionThroughBuffers));
+		compression_buffers->buflen = 1024;
+		compression_buffers->idslen = 256;
+		compression_buffers->buf = palloc(compression_buffers->buflen);
+		compression_buffers->idsbuf =
+				(uint32 *) palloc(compression_buffers->idslen * sizeof(uint32));
+		MemoryContextSwitchTo(old_mcxt);
+
+		compression_buffers->item_mcxt = AllocSetContextCreate(compression_mcxt,
+												 "jsonbc item context",
+												 ALLOCSET_DEFAULT_SIZES);
+	}
 }
 
 static void
@@ -259,7 +280,7 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 	JsonbParseState	   *state = NULL;
 	struct varlena	   *res;
 
-	init_memory_context();
+	init_memory_context(true);
 
 	it = JsonbIteratorInit(&((Jsonb *) data)->root);
 	while ((r = JsonbIteratorNext(&it, &jv, false)) != 0)
@@ -275,7 +296,7 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 					offset = 0;
 
 			/* maximum length of encoded uint32 is 5 */
-			char   *keyptr = MemoryContextAlloc(compression_mcxt, nkeys * 5),
+			char   *keyptr = MemoryContextAlloc(compression_buffers->item_mcxt, nkeys * 5),
 				   *buf;
 			uint32 *idsbuf;
 
@@ -339,6 +360,8 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 
 	res = (struct varlena *) packJsonbValue(jbv, VARHDRSZ_CUSTOM_COMPRESSED, &size);
 	SET_VARSIZE_COMPRESSED(res, size);
+
+	MemoryContextReset(compression_buffers->item_mcxt);
 	return res;
 }
 
@@ -360,7 +383,7 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 	JsonbParseState	   *state = NULL;
 	struct varlena	   *res;
 
-	init_memory_context();
+	init_memory_context(false);
 	Assert(VARATT_IS_CUSTOM_COMPRESSED(data));
 
 	jb = (Jsonb *) ((char *) data + VARHDRSZ_CUSTOM_COMPRESSED - offsetof(Jsonb, root));
@@ -403,4 +426,44 @@ jsonbc_compression_handler(PG_FUNCTION_ARGS)
 	cmr->decompress = jsonbc_decompress;
 
 	PG_RETURN_POINTER(cmr);
+}
+
+static Oid
+get_extension_schema(void)
+{
+	Oid				result;
+	Relation		rel;
+	SysScanDesc		scandesc;
+	HeapTuple		tuple;
+	ScanKeyData		entry[1];
+	Oid				ext_oid;
+
+	if (!IsTransactionState())
+		return InvalidOid;
+
+	ext_oid = get_extension_oid("jsonbc", true);
+	if (ext_oid == InvalidOid)
+		return InvalidOid;
+
+	ScanKeyInit(&entry[0],
+				ObjectIdAttributeNumber,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ext_oid));
+
+	rel = heap_open(ExtensionRelationId, AccessShareLock);
+	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
+								  NULL, 1, entry);
+
+	tuple = systable_getnext(scandesc);
+
+	/* We assume that there can be at most one matching tuple */
+	if (HeapTupleIsValid(tuple))
+		result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
+	else
+		result = InvalidOid;
+
+	systable_endscan(scandesc);
+
+	heap_close(rel, AccessShareLock);
+	return result;
 }
