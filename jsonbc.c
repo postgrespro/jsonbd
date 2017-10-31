@@ -7,14 +7,18 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_type.h"
-#include "catalog/indexing.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
+#include "storage/ipc.h"
+#include "storage/shm_toc.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -22,7 +26,6 @@
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(jsonbc_compression_handler);
-PG_FUNCTION_INFO_V1(int4_to_char);
 
 /* we use one buffer for whole transaction to avoid extra allocations */
 typedef struct
@@ -35,21 +38,177 @@ typedef struct
 	MemoryContext	item_mcxt;
 } CompressionThroughBuffers;
 
+/* local */
 static MemoryContext compression_mcxt = NULL;
 static CompressionThroughBuffers *compression_buffers = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static shm_toc *toc = NULL;
+
+/* global */
+void *workers_data = NULL;
+int jsonbc_nworkers = -1;
+int jsonbc_cache_size = 0;
+int jsonbc_queue_size = 0;
 
 static void init_memory_context(bool);
 static void memory_reset_callback(void *arg);
-static void get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys);
-static char *get_key_by_id(Oid cmoptoid, int32 key_id);
 static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
 static uint32 decode_varbyte(unsigned char *ptr);
 static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
 static Oid get_extension_schema(void);
+static void setup_guc_variables(void);
 
-/* TODO: change to worker, add caches and other stuff */
+static inline Size
+jsonbc_get_queue_size(void)
+{
+	return (Size) (jsonbc_queue_size * 1024);
+}
+
+static size_t
+jsonbc_shmem_size(void)
+{
+	int					i;
+	shm_toc_estimator	e;
+	Size				size;
+
+	Assert(jsonbc_nworkers != -1);
+	shm_toc_initialize_estimator(&e);
+
+	shm_toc_estimate_chunk(&e, sizeof(jsonbc_shm_hdr));
+	for (i = 0; i < jsonbc_nworkers; i++)
+	{
+		shm_toc_estimate_chunk(&e, sizeof(jsonbc_shm_worker));
+		shm_toc_estimate_chunk(&e, jsonbc_get_queue_size());
+		shm_toc_estimate_chunk(&e, jsonbc_get_queue_size());
+	}
+	shm_toc_estimate_keys(&e, jsonbc_nworkers * 3 + 1);
+	size = shm_toc_estimate(&e);
+	return size;
+}
+
 static void
-get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
+jsonbc_shmem_startup_hook(void)
+{
+	int				mqkey;
+	bool			found;
+	Size			size = jsonbc_shmem_size();
+	jsonbc_shm_hdr *hdr;
+
+	/* Invoke original hook if needed */
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	workers_data = ShmemInitStruct("jsonbc workers shmem", size, &found);
+
+	if (!found)
+	{
+		int i;
+
+		toc = shm_toc_create(JSONBC_SHM_MQ_MAGIC, workers_data, size);
+		hdr = shm_toc_allocate(toc, sizeof(jsonbc_shm_hdr));
+		hdr->workers_ready = 0;
+		shm_toc_insert(toc, 0, hdr);
+		mqkey = jsonbc_nworkers + 1;
+
+		for (i = 0; i < jsonbc_nworkers; i++)
+		{
+			jsonbc_shm_worker	*wd = shm_toc_allocate(toc, sizeof(jsonbc_shm_worker));
+
+			/* each worker will have two mq, for input and output */
+			wd->mqin = shm_mq_create(shm_toc_allocate(toc, jsonbc_get_queue_size()),
+							   jsonbc_get_queue_size());
+			wd->mqout = shm_mq_create(shm_toc_allocate(toc, jsonbc_get_queue_size()),
+							   jsonbc_get_queue_size());
+
+			/* init worker context */
+			pg_atomic_init_flag(&wd->busy);
+			wd->proc = NULL;
+
+			shm_toc_insert(toc, i + 1, wd);
+			shm_toc_insert(toc, mqkey++, wd->mqin);
+			shm_toc_insert(toc, mqkey++, wd->mqout);
+		}
+	}
+	else toc = shm_toc_attach(JSONBC_SHM_MQ_MAGIC, workers_data);
+
+	LWLockRelease(AddinShmemInitLock);
+}
+
+void
+_PG_init(void)
+{
+	if (!process_shared_preload_libraries_in_progress)
+	{
+		ereport(ERROR,
+				(errmsg("jsonbc module must be initialized in postmaster."),
+				 errhint("add 'jsonbc' to shared_preload_libraries parameter in postgresql.conf")));
+	}
+
+	setup_guc_variables();
+
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = jsonbc_shmem_startup_hook;
+
+	if (jsonbc_nworkers)
+	{
+		int i;
+		RequestAddinShmemSpace(jsonbc_shmem_size());
+		for (i = 0; i < jsonbc_nworkers; i++)
+			jsonbc_register_worker(i);
+	}
+	else elog(LOG, "jsonbc: workers are disabled");
+}
+
+static void
+setup_guc_variables(void)
+{
+	DefineCustomIntVariable("jsonbc.workers_count",
+							"Count of workers for jsonbc compresssion",
+							NULL,
+							&jsonbc_nworkers,
+							1, /* default */
+							0, /* if zero then no workers */
+							MAX_JSONBC_WORKERS,
+							PGC_SUSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("jsonbc.cache_size",
+							"Cache size for each compression options (kilobytes)",
+							NULL,
+							&jsonbc_cache_size,
+							1, /* 1kb by default */
+							0,	/* no cache */
+							1024, /* 1 mb */
+							PGC_SUSET,
+							GUC_UNIT_KB,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("jsonbc.queue_size",
+							"Size of queue used for communication with workers (kilobytes)",
+							NULL,
+							&jsonbc_queue_size,
+							1, /* 1kb by default */
+							1,	/* 1 kb is minimum too */
+							1024, /* 1 mb */
+							PGC_SUSET,
+							GUC_UNIT_KB,
+							NULL,
+							NULL,
+							NULL);
+}
+
+/*
+ * Get key IDs using relation
+ * TODO: change to direct access
+ */
+void
+jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 {
 	int		i;
 	char   *nspc = get_namespace_name(get_extension_schema());
@@ -99,15 +258,94 @@ get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 	SPI_finish();
 }
 
-static char *
-get_key_by_id(Oid cmoptoid, int32 key_id)
+/* Get key IDs using workers */
+void
+jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys)
+{
+	int		i;
+
+	if (jsonbc_nworkers <= 0)
+	{
+		/* if workers are disabled then backend will do all the work itself */
+		jsonbc_get_key_ids_slow(cmoptoid, buf, idsbuf, nkeys);
+		return;
+	}
+
+again:
+	for (i = 0; i < jsonbc_nworkers; i++)
+	{
+		shm_mq_result		resmq;
+		shm_mq_iovec		iov[3];
+		shm_mq_handle	   *mqh;
+
+		char			   *res;
+		Size				reslen;
+
+		jsonbc_shm_worker *wd = shm_toc_lookup(toc, i + 1, false);
+
+		if (!pg_atomic_test_set_flag(&wd->busy))
+			continue;
+
+		iov[0].data = (void *) &nkeys;
+		iov[0].len = sizeof(int);
+
+		iov[1].data = (void *) &cmoptoid;
+		iov[1].len = sizeof(Oid);
+
+		iov[2].data = buf;
+		iov[2].len = buflen;
+
+		elog(LOG, "sending data, %d keys, oid %d, bytes: %ld",
+				nkeys, cmoptoid, iov[2].len);
+
+		/* send keys */
+		shm_mq_set_sender(wd->mqin, MyProc);
+		mqh = shm_mq_attach(wd->mqin, NULL, NULL);
+		resmq = shm_mq_sendv(mqh, iov, 3, false);
+		if (resmq != SHM_MQ_SUCCESS)
+			elog(ERROR, "jsonbc: worker has detached");
+		shm_mq_detach(mqh);
+
+		/* get IDs */
+		shm_mq_set_receiver(wd->mqout, MyProc);
+		mqh = shm_mq_attach(wd->mqout, NULL, NULL);
+		resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
+		if (resmq != SHM_MQ_SUCCESS)
+			elog(ERROR, "jsonbc: worker has detached");
+
+		if (reslen == 1)
+			elog(ERROR, "jsonbc: worker couldn't encode keys");
+
+		/* size of the received data should be equal to key array size */
+		Assert(reslen == sizeof(uint32) * nkeys);
+		memcpy((void *) idsbuf, res, reslen);
+		shm_mq_detach(mqh);
+
+		shm_mq_clean_sender(wd->mqin);
+		shm_mq_clean_receiver(wd->mqout);
+
+		pg_atomic_clear_flag(&wd->busy);
+
+		/* we're done here */
+		return;
+	}
+
+	CHECK_FOR_INTERRUPTS();
+	pg_usleep(100);
+
+	/* TODO: add attempts count check */
+	goto again;
+}
+
+char *
+jsonbc_get_key_by_id(Oid cmoptoid, int32 key_id)
 {
 	MemoryContext	old_mcxt;
 
 	char *nspc = get_namespace_name(get_extension_schema());
 	char *res = NULL;
 	char *sql = psprintf("SELECT key FROM %s.jsonbc_dictionary WHERE cmopt = %d"
-				"	AND id = %d", nspc, cmoptoid, key_id);
+						 "	AND id = %d", nspc, cmoptoid, key_id);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
@@ -339,23 +577,25 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 			Assert(offset == len);
 
 			/* retrieve or generate ids */
-			get_key_ids(ac->cmoptoid, buf, idsbuf, nkeys);
+			jsonbc_get_key_ids(ac->cmoptoid, buf, len, idsbuf, nkeys);
 
 			/* replace the old keys with encoded ids */
 			for (i = 0; i < nkeys; i++)
 			{
+				int keylen;
+
 				JsonbValue *v = &jbv->val.object.pairs[i].key;
 
-				encode_varbyte(idsbuf[i], (unsigned char *) keyptr, &len);
+				encode_varbyte(idsbuf[i], (unsigned char *) keyptr, &keylen);
 				v->val.string.val = keyptr;
-				v->val.string.len = len;
-				keyptr += len;
+				v->val.string.len = keylen;
+				keyptr += keylen;
 			}
 		}
 	}
 
 	/* don't compress scalar values */
-	if (IsAJsonbScalar(jbv))
+	if (jbv == NULL || IsAJsonbScalar(jbv))
 		return NULL;
 
 	res = (struct varlena *) packJsonbValue(jbv, VARHDRSZ_CUSTOM_COMPRESSED, &size);
@@ -399,7 +639,7 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 			key_id = decode_varbyte((unsigned char *) v.val.string.val);
 
 			v.type = jbvString;
-			v.val.string.val = get_key_by_id(ac->cmoptoid, key_id);
+			v.val.string.val = jsonbc_get_key_by_id(ac->cmoptoid, key_id);
 			v.val.string.len = strlen(v.val.string.val);
 		}
 		jbv = pushJsonbValue(&state, r, r < WJB_BEGIN_ARRAY ? &v : NULL);

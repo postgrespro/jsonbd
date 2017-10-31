@@ -1,7 +1,7 @@
 # contrib/jsonbc/Makefile
 
 MODULE_big = jsonbc
-OBJS= jsonbc.o $(WIN32RES)
+OBJS= jsonbc.o jsonbc_worker.o $(WIN32RES)
 
 EXTENSION = jsonbc
 DATA = jsonbc--0.1.sql

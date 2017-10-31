@@ -19,6 +19,8 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+\q
+
 SELECT comp.add_record();
 SELECT comp.add_record();
 SELECT comp.add_record();

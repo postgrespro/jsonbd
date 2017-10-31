@@ -5,3 +5,4 @@
 /results
 regression.diffs
 regression.out
+*.plist
