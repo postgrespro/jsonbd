@@ -338,6 +338,7 @@ void
 worker_main(Datum arg)
 {
 	MemoryContext	worker_context;
+	shm_mq_handle  *mqh = NULL;
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -365,10 +366,11 @@ worker_main(Datum arg)
 		Size	nbytes;
 		void   *data;
 
-		shm_mq_handle  *mqh;
 		shm_mq_result	resmq;
 
-		mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
+		if (!mqh)
+			mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
+
 		resmq = shm_mq_receive(mqh, &nbytes, &data, true);
 
 		if (resmq == SHM_MQ_SUCCESS)
@@ -409,7 +411,10 @@ worker_main(Datum arg)
 				elog(NOTICE, "jsonbc: backend detached early");
 
 			shm_mq_detach(mqh);
-			pfree((void *) iov.data);
+			MemoryContextReset(worker_context);
+
+			/* mark we need new handle */
+			mqh = NULL;
 		}
 
 		if (shutdown_requested)

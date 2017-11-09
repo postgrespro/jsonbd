@@ -157,17 +157,22 @@ jsonbc_shmem_startup_hook(void)
 
 		for (i = 0; i < jsonbc_nworkers; i++)
 		{
+			size_t queue_size = jsonbc_get_queue_size();
+
 			jsonbc_shm_worker	*wd = shm_toc_allocate(toc, sizeof(jsonbc_shm_worker));
 
 			/* each worker will have two mq, for input and output */
-			wd->mqin = shm_mq_create(shm_toc_allocate(toc, jsonbc_get_queue_size()),
-							   jsonbc_get_queue_size());
-			wd->mqout = shm_mq_create(shm_toc_allocate(toc, jsonbc_get_queue_size()),
-							   jsonbc_get_queue_size());
+			wd->mqin = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
+			wd->mqout = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
 
 			/* init worker context */
 			pg_atomic_init_flag(&wd->busy);
 			wd->proc = NULL;
+
+			shm_mq_clean_receiver(wd->mqin);
+			shm_mq_clean_receiver(wd->mqout);
+			shm_mq_clean_sender(wd->mqin);
+			shm_mq_clean_sender(wd->mqout);
 
 			shm_toc_insert(toc, i + 1, wd);
 			shm_toc_insert(toc, mqkey++, wd->mqin);
