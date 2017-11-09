@@ -2,6 +2,7 @@
 
 #include "postgres.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "pgstat.h"
 
 #include "access/genam.h"
@@ -30,8 +31,6 @@
 static bool xact_started = false;
 static bool shutdown_requested = false;
 static jsonbc_shm_worker	*worker_state;
-static shm_mq_handle		*worker_mq_handle_in;
-static shm_mq_handle		*worker_mq_handle_out;
 
 Oid jsonbc_dictionary_reloid = InvalidOid;
 Oid	jsonbc_keys_indoid = InvalidOid;
@@ -82,16 +81,15 @@ init_local_variables(int worker_num)
 
 	/* input mq */
 	shm_mq_set_receiver(worker_state->mqin, MyProc);
-	worker_mq_handle_in = shm_mq_attach(worker_state->mqin, NULL, NULL);
 
 	/* output mq */
 	shm_mq_set_sender(worker_state->mqout, MyProc);
-	worker_mq_handle_out = shm_mq_attach(worker_state->mqout, NULL, NULL);
 
 	/* not busy at start */
 	pg_atomic_clear_flag(&worker_state->busy);
 
-	elog(LOG, "jsonbc dictionary worker %d started", worker_num + 1);
+	elog(LOG, "jsonbc dictionary worker %d started with pid: %d",
+			worker_num + 1, MyProcPid);
 }
 
 static void
@@ -224,8 +222,13 @@ jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys, size_t *reslen)
 static void
 jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 {
+	Relation	rel;
+
 	int		i;
+	Oid		relid = jsonbc_get_dictionary_relid();
 	char   *nspc = get_namespace_name(get_extension_schema());
+
+	rel = relation_open(relid, ShareLock);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
@@ -270,6 +273,7 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		pfree(sql);
 	}
 	SPI_finish();
+	relation_close(rel, ShareLock);
 }
 
 static char *
@@ -361,8 +365,12 @@ worker_main(Datum arg)
 		Size	nbytes;
 		void   *data;
 
-		shm_mq_result resmq = shm_mq_receive(worker_mq_handle_in, &nbytes,
-											   &data, true);
+		shm_mq_handle  *mqh;
+		shm_mq_result	resmq;
+
+		mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
+		resmq = shm_mq_receive(mqh, &nbytes, &data, true);
+
 		if (resmq == SHM_MQ_SUCCESS)
 		{
 			JsonbcCommand	cmd;
@@ -393,10 +401,14 @@ worker_main(Datum arg)
 					elog(NOTICE, "jsonbc: got unknown command");
 			}
 
-			resmq = shm_mq_sendv(worker_mq_handle_out, &iov, 1, false);
+			shm_mq_detach(mqh);
+
+			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
+			resmq = shm_mq_sendv(mqh, &iov, 1, false);
 			if (resmq != SHM_MQ_SUCCESS)
 				elog(NOTICE, "jsonbc: backend detached early");
 
+			shm_mq_detach(mqh);
 			pfree((void *) iov.data);
 		}
 
@@ -412,8 +424,6 @@ worker_main(Datum arg)
 		ResetLatch(&MyProc->procLatch);
 	}
 
-	shm_mq_detach(worker_mq_handle_in);
-	shm_mq_detach(worker_mq_handle_out);
 	elog(LOG, "jsonbc dictionary worker has ended its work");
 	proc_exit(0);
 }

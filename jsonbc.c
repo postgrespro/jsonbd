@@ -342,6 +342,12 @@ again:
 			detached = true;
 		shm_mq_detach(mqh);
 
+		/*
+		 * we need to clean sender before receiving, because we need to block
+		 * worker after we received data
+		 */
+		shm_mq_clean_sender(wd->mqin);
+
 		/* get data */
 		if (!detached)
 		{
@@ -357,8 +363,7 @@ again:
 			shm_mq_detach(mqh);
 		}
 
-		/* clean and unlock mq */
-		shm_mq_clean_sender(wd->mqin);
+		/* clean self as receiver and unlock mq */
 		shm_mq_clean_receiver(wd->mqout);
 		pg_atomic_clear_flag(&wd->busy);
 
