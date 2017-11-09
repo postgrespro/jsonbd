@@ -9,9 +9,7 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_attribute.h"
-#include "catalog/pg_extension.h"
 #include "catalog/pg_type.h"
-#include "commands/extension.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -38,6 +36,23 @@ typedef struct
 	MemoryContext	item_mcxt;
 } CompressionThroughBuffers;
 
+#if PG_VERSION_NUM == 110000
+struct shm_mq_alt
+{
+	slock_t		mq_mutex;
+	PGPROC	   *mq_receiver;	/* this one */
+	PGPROC	   *mq_sender;		/* this one */
+	uint64		mq_bytes_read;
+	uint64		mq_bytes_written;
+	Size		mq_ring_size;
+	bool		mq_detached;	/* and this one */
+
+	/* in postgres version there are more attributes, but we don't need them */
+};
+#else
+#error "shm_mq struct in jsonbc is copied from PostgreSQL 11, please correct it according to your version"
+#endif
+
 /* local */
 static MemoryContext compression_mcxt = NULL;
 static CompressionThroughBuffers *compression_buffers = NULL;
@@ -55,13 +70,42 @@ static void memory_reset_callback(void *arg);
 static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
 static uint32 decode_varbyte(unsigned char *ptr);
 static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
-static Oid get_extension_schema(void);
 static void setup_guc_variables(void);
+static void shm_mq_clean_sender(shm_mq *mq);
+static void shm_mq_clean_receiver(shm_mq *mq);
+static void jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, char **keys);
+static void jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
 
 static inline Size
 jsonbc_get_queue_size(void)
 {
 	return (Size) (jsonbc_queue_size * 1024);
+}
+
+static void
+shm_mq_clean_sender(shm_mq *mq)
+{
+	struct shm_mq_alt	*amq = (struct shm_mq_alt *) mq;
+
+	/* check that attributes are same and our struct still compatible with global shm_mq */
+	Assert(shm_mq_get_sender(mq) == amq->mq_sender);
+	Assert(shm_mq_get_receiver(mq) == amq->mq_receiver);
+
+	amq->mq_sender = NULL;
+	amq->mq_detached = false;
+}
+
+static void
+shm_mq_clean_receiver(shm_mq *mq)
+{
+	struct shm_mq_alt	*amq = (struct shm_mq_alt *) mq;
+
+	/* check that attributes are same and our struct still compatible with global shm_mq */
+	Assert(shm_mq_get_sender(mq) == amq->mq_sender);
+	Assert(shm_mq_get_receiver(mq) == amq->mq_receiver);
+
+	amq->mq_receiver = NULL;
+	amq->mq_detached = false;
 }
 
 static size_t
@@ -203,128 +247,126 @@ setup_guc_variables(void)
 							NULL);
 }
 
-/*
- * Get key IDs using relation
- * TODO: change to direct access
- */
-void
-jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
+typedef struct ids_callback_state
 {
-	int		i;
-	char   *nspc = get_namespace_name(get_extension_schema());
+	uint32 *idsbuf;
+	int		nkeys;
+} ids_callback_state;
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+static bool
+ids_callback(char *res, size_t reslen, void *arg)
+{
+	ids_callback_state *state;
 
-	for (i = 0; i < nkeys; i++)
-	{
-		Datum		datum;
-		bool		isnull;
-		char	   *sql;
+	/*
+	 * when there is at least one key, reslen will be >= sizeof(uint32),
+	 * so we can safely use 1 as indicator if something went wrong
+	 */
+	if (reslen == 1)
+		return false;
 
-		sql = psprintf("SELECT id FROM %s.jsonbc_dictionary WHERE cmopt = %d"
-					   "	AND key = '%s'", nspc, cmoptoid, buf);
-
-		if (SPI_exec(sql, 0) != SPI_OK_SELECT)
-			elog(ERROR, "SPI_exec failed");
-
-		if (SPI_processed == 0)
-		{
-			char *sql2 = psprintf("with t as (select (coalesce(max(id), 0) + 1) new_id from "
-						"%s.jsonbc_dictionary where cmopt = %d) insert into %s.jsonbc_dictionary"
-						" select %d, t.new_id, '%s' from t returning id",
-						nspc, cmoptoid, nspc, cmoptoid, buf);
-
-			if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
-				elog(ERROR, "SPI_exec failed");
-		}
-
-		datum = SPI_getbinval(SPI_tuptable->vals[0],
-							  SPI_tuptable->tupdesc,
-							  1,
-							  &isnull);
-		if (isnull)
-			elog(ERROR, "id is NULL");
-
-		idsbuf[i] = DatumGetInt32(datum);
-
-		/* move to next key */
-		while (*buf != '\0')
-			buf++;
-
-		buf++;
-		pfree(sql);
-	}
-	SPI_finish();
+	/* size of the received data should be equal to key array size */
+	state = (ids_callback_state *) arg;
+	Assert(reslen == sizeof(uint32) * state->nkeys);
+	memcpy((void *) state->idsbuf, res, reslen);
+	return true;
 }
 
-/* Get key IDs using workers */
-void
-jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys)
+typedef struct
 {
-	int		i;
+	char **keys;
+	int	   nkeys;
+} keys_callback_state;
+
+static bool
+keys_callback(char *res, size_t reslen, void *arg)
+{
+	int		i = 0,
+			nkeys = 0;
+
+	keys_callback_state *state = (keys_callback_state *) arg;
+
+	/* it should at least two symbols in the response */
+	if (reslen == 1)
+		return false;
+
+	/* increase the global buffer if we need to */
+	if (reslen > compression_buffers->buflen)
+	{
+		compression_buffers->buf =
+			(char *) repalloc(compression_buffers->buf, reslen);
+		compression_buffers->buflen = reslen;
+	}
+
+	memcpy(compression_buffers->buf, res, reslen);
+
+	while (reslen--)
+	{
+		if (res[i] != '\0')
+			state->keys[nkeys++] = &compression_buffers->buf[i];
+		i++;
+	}
+
+	return (nkeys == state->nkeys);
+}
+
+static void
+jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
+		bool (*callback)(char *, size_t, void *), void *callback_arg)
+{
+	int					i;
+	bool				detached = false;
+	bool				callback_succeded = false;
+	shm_mq_result		resmq;
+	shm_mq_handle	   *mqh;
+
+	char			   *res;
+	Size				reslen;
 
 	if (jsonbc_nworkers <= 0)
-	{
-		/* if workers are disabled then backend will do all the work itself */
-		jsonbc_get_key_ids_slow(cmoptoid, buf, idsbuf, nkeys);
-		return;
-	}
+		/* TODO: maybe add support of multiple databases for dictionaries */
+		elog(ERROR, "jsonbc workers are not available");
 
 again:
 	for (i = 0; i < jsonbc_nworkers; i++)
 	{
-		shm_mq_result		resmq;
-		shm_mq_iovec		iov[3];
-		shm_mq_handle	   *mqh;
-
-		char			   *res;
-		Size				reslen;
-
 		jsonbc_shm_worker *wd = shm_toc_lookup(toc, i + 1, false);
-
 		if (!pg_atomic_test_set_flag(&wd->busy))
 			continue;
 
-		iov[0].data = (void *) &nkeys;
-		iov[0].len = sizeof(int);
-
-		iov[1].data = (void *) &cmoptoid;
-		iov[1].len = sizeof(Oid);
-
-		iov[2].data = buf;
-		iov[2].len = buflen;
-
-		elog(LOG, "sending data, %d keys, oid %d, bytes: %ld",
-				nkeys, cmoptoid, iov[2].len);
-
-		/* send keys */
+		/* send data */
 		shm_mq_set_sender(wd->mqin, MyProc);
 		mqh = shm_mq_attach(wd->mqin, NULL, NULL);
-		resmq = shm_mq_sendv(mqh, iov, 3, false);
+		resmq = shm_mq_sendv(mqh, iov, iov_len, false);
 		if (resmq != SHM_MQ_SUCCESS)
-			elog(ERROR, "jsonbc: worker has detached");
+			detached = true;
 		shm_mq_detach(mqh);
 
-		/* get IDs */
-		shm_mq_set_receiver(wd->mqout, MyProc);
-		mqh = shm_mq_attach(wd->mqout, NULL, NULL);
-		resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
-		if (resmq != SHM_MQ_SUCCESS)
-			elog(ERROR, "jsonbc: worker has detached");
+		/* get data */
+		if (!detached)
+		{
+			shm_mq_set_receiver(wd->mqout, MyProc);
+			mqh = shm_mq_attach(wd->mqout, NULL, NULL);
+			resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
+			if (resmq != SHM_MQ_SUCCESS)
+				detached = true;
 
-		if (reslen == 1)
-			elog(ERROR, "jsonbc: worker couldn't encode keys");
+			if (!detached)
+				callback_succeded = callback(res, reslen, callback_arg);
 
-		/* size of the received data should be equal to key array size */
-		Assert(reslen == sizeof(uint32) * nkeys);
-		memcpy((void *) idsbuf, res, reslen);
-		shm_mq_detach(mqh);
+			shm_mq_detach(mqh);
+		}
 
+		/* clean and unlock mq */
 		shm_mq_clean_sender(wd->mqin);
 		shm_mq_clean_receiver(wd->mqout);
-
 		pg_atomic_clear_flag(&wd->busy);
+
+		if (detached)
+			elog(ERROR, "jsonbc: worker has detached");
+
+		if (!callback_succeded)
+			elog(ERROR, "jsonbc: communication error");
 
 		/* we're done here */
 		return;
@@ -337,44 +379,54 @@ again:
 	goto again;
 }
 
-char *
-jsonbc_get_key_by_id(Oid cmoptoid, int32 key_id)
+/* Get key IDs using workers */
+static void
+jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys)
 {
-	MemoryContext	old_mcxt;
+	JsonbcCommand		cmd = JSONBC_CMD_GET_IDS;
+	shm_mq_iovec		iov[4];
+	ids_callback_state	state;
 
-	char *nspc = get_namespace_name(get_extension_schema());
-	char *res = NULL;
-	char *sql = psprintf("SELECT key FROM %s.jsonbc_dictionary WHERE cmopt = %d"
-						 "	AND id = %d", nspc, cmoptoid, key_id);
+	iov[0].data = (void *) &nkeys;
+	iov[0].len = sizeof(int);
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	iov[1].data = (void *) &cmoptoid;
+	iov[1].len = sizeof(Oid);
 
-	if (SPI_exec(sql, 0) != SPI_OK_SELECT)
-		elog(ERROR, "SPI_exec failed");
+	iov[2].data = (void *) &cmd;
+	iov[2].len = sizeof(JsonbcCommand);
 
-	if (SPI_processed > 0)
-	{
-		bool		isnull;
-		Datum		datum;
+	iov[3].data = buf;
+	iov[3].len = buflen;
 
-		datum = SPI_getbinval(SPI_tuptable->vals[0],
-							  SPI_tuptable->tupdesc,
-							  1,
-							  &isnull);
-		if (isnull)
-			elog(ERROR, "id is NULL");
+	state.idsbuf = idsbuf;
+	state.nkeys = nkeys;
+	jsonbc_communicate(iov, 4, ids_callback, &state);
+}
 
-		old_mcxt = MemoryContextSwitchTo(compression_mcxt);
-		res = text_to_cstring(DatumGetTextP(datum));
-		MemoryContextSwitchTo(old_mcxt);
-	}
-	else elog(ERROR, "key not found");
+/* Get keys by their IDs using workers */
+static void
+jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, char **keys)
+{
+	JsonbcCommand		cmd = JSONBC_CMD_GET_KEYS;
+	shm_mq_iovec		iov[4];
+	keys_callback_state	state;
 
-	pfree(sql);
-	SPI_finish();
+	iov[0].data = (void *) &nkeys;
+	iov[0].len = sizeof(int);
 
-	return res;
+	iov[1].data = (void *) &cmoptoid;
+	iov[1].len = sizeof(Oid);
+
+	iov[2].data = (void *) &cmd;
+	iov[2].len = sizeof(JsonbcCommand);
+
+	iov[3].data = (char *) ids;
+	iov[3].len = sizeof(uint32) * nkeys;
+
+	state.keys = keys;
+	state.nkeys = nkeys;
+	jsonbc_communicate(iov, 4, keys_callback, &state);
 }
 
 /*
@@ -477,6 +529,7 @@ memory_reset_callback(void *arg)
  * The result is palloc'd.
  * It adds a space for header, that should be filled later.
  */
+#ifdef PGPRO_JSONBC
 static char *
 packJsonbValue(JsonbValue *val, int header_size, int *len)
 {
@@ -505,6 +558,24 @@ packJsonbValue(JsonbValue *val, int header_size, int *len)
 	*len = buffer.len;
 	return buffer.data;
 }
+#else
+static char *
+packJsonbValue(JsonbValue *val, int header_size, int *len)
+{
+	Jsonb  *jb = JsonbValueToJsonb(val);
+	int		size = VARSIZE(jb);
+
+	if (header_size != VARHDRSZ)
+	{
+		Assert(header_size > VARHDRSZ);
+		*len = size + (header_size - VARHDRSZ);
+		jb = (Jsonb *) repalloc((void *) jb, *len);
+		memmove((char *)jb + header_size, (char *)jb + VARHDRSZ, size - VARHDRSZ);
+		memset((char *) jb, 0, header_size);
+	}
+	return (char *) jb;
+}
+#endif
 
 /* Compress jsonb using dictionary */
 static struct varlena *
@@ -630,19 +701,47 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 	it = JsonbIteratorInit(&jb->root);
 	while ((r = JsonbIteratorNext(&it, &v, false)) != 0)
 	{
-		if (r == WJB_KEY)
-		{
-			int32		key_id;
-
-			Assert(v.type == jbvString);
-			Assert(v.val.string.len <= 5);
-			key_id = decode_varbyte((unsigned char *) v.val.string.val);
-
-			v.type = jbvString;
-			v.val.string.val = jsonbc_get_key_by_id(ac->cmoptoid, key_id);
-			v.val.string.len = strlen(v.val.string.val);
-		}
 		jbv = pushJsonbValue(&state, r, r < WJB_BEGIN_ARRAY ? &v : NULL);
+
+		if (r == WJB_END_OBJECT && jbv->type == jbvObject)
+		{
+			char  **keys;
+			int		i,
+					nkeys = jbv->val.object.nPairs;
+
+			/* increase the size of buffer for key ids if we need to */
+			if (nkeys > compression_buffers->idslen)
+			{
+				compression_buffers->idsbuf =
+					(uint32 *) repalloc(compression_buffers->idsbuf, nkeys * sizeof(uint32));
+				compression_buffers->idslen = nkeys;
+			}
+
+			/* decode keys */
+			for (i = 0; i < nkeys; i++)
+			{
+				int32		key_id;
+				JsonbValue *v = &jbv->val.object.pairs[i].key;
+
+				Assert(v->type == jbvString);
+				Assert(v->val.string.len <= 5);
+				key_id = decode_varbyte((unsigned char *) v->val.string.val);
+				compression_buffers->idsbuf[i] = key_id;
+			}
+
+			/* retrieve or generate ids */
+			keys = (char **) palloc(sizeof(char *) * nkeys);
+			jsonbc_get_keys(ac->cmoptoid, compression_buffers->idsbuf, nkeys, keys);
+
+			/* replace the encoded keys with real keys */
+			for (i = 0; i < nkeys; i++)
+			{
+				JsonbValue *v = &jbv->val.object.pairs[i].key;
+				v->val.string.val = keys[i];
+				v->val.string.len = strlen(keys[i]);
+			}
+			pfree(keys);
+		}
 	}
 
 	res = (struct varlena *) JsonbValueToJsonb(jbv);
@@ -666,44 +765,4 @@ jsonbc_compression_handler(PG_FUNCTION_ARGS)
 	cmr->decompress = jsonbc_decompress;
 
 	PG_RETURN_POINTER(cmr);
-}
-
-static Oid
-get_extension_schema(void)
-{
-	Oid				result;
-	Relation		rel;
-	SysScanDesc		scandesc;
-	HeapTuple		tuple;
-	ScanKeyData		entry[1];
-	Oid				ext_oid;
-
-	if (!IsTransactionState())
-		return InvalidOid;
-
-	ext_oid = get_extension_oid("jsonbc", true);
-	if (ext_oid == InvalidOid)
-		return InvalidOid;
-
-	ScanKeyInit(&entry[0],
-				ObjectIdAttributeNumber,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(ext_oid));
-
-	rel = heap_open(ExtensionRelationId, AccessShareLock);
-	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
-								  NULL, 1, entry);
-
-	tuple = systable_getnext(scandesc);
-
-	/* We assume that there can be at most one matching tuple */
-	if (HeapTupleIsValid(tuple))
-		result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
-	else
-		result = InvalidOid;
-
-	systable_endscan(scandesc);
-
-	heap_close(rel, AccessShareLock);
-	return result;
 }

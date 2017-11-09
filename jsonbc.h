@@ -10,6 +10,11 @@
 #define JSONBC_SHM_MQ_MAGIC		0xAAAA
 #define MAX_JSONBC_WORKERS		10
 
+typedef enum {
+	JSONBC_CMD_GET_IDS,
+	JSONBC_CMD_GET_KEYS
+} JsonbcCommand;
+
 typedef struct jsonbc_shm_hdr
 {
 	volatile int workers_ready;
@@ -25,12 +30,6 @@ typedef struct jsonbc_shm_worker
 
 extern void _PG_init(void);
 extern void jsonbc_register_worker(int n);
-
-extern void jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
-extern void jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys);
-
-extern char *jsonbc_get_key_by_id(Oid cmoptoid, int32 key_id);
-extern char *jsonbc_get_key_by_id_slow(Oid cmoptoid, int32 key_id);
 
 extern void *workers_data;
 extern int jsonbc_nworkers;
