@@ -740,9 +740,9 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 			/* replace the encoded keys with real keys */
 			for (i = 0; i < nkeys; i++)
 			{
-				size_t	oldoff = offset;
+				size_t		oldoff	= offset;
+				JsonbValue *v		= &jbv->val.object.pairs[i].key;
 
-				JsonbValue *v = &jbv->val.object.pairs[i].key;
 				v->val.string.val = &buf[offset];
 
 				/* move to next key in buffer */
