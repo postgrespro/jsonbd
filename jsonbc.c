@@ -744,8 +744,12 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 
 				JsonbValue *v = &jbv->val.object.pairs[i].key;
 				v->val.string.val = &buf[offset];
-				while (buf[offset++] != '\0');
-				v->val.string.len = offset - oldoff - 2;
+
+				/* move to next key in buffer */
+				while (buf[offset++] != '\0')
+					Assert(offset <= buflen);
+
+				v->val.string.len = offset - oldoff - 1;
 			}
 
 			/* check correctness */
