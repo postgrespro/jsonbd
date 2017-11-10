@@ -21,6 +21,7 @@
 #include "storage/proc.h"
 #include "storage/shm_mq.h"
 #include "storage/shm_toc.h"
+#include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
@@ -29,17 +30,17 @@
 #include "utils/rel.h"
 #include "utils/lsyscache.h"
 
-static bool xact_started = false;
-static bool shutdown_requested = false;
-static jsonbc_shm_worker	*worker_state;
+static bool						xact_started = false;
+static bool						shutdown_requested = false;
+static jsonbc_shm_worker	   *worker_state;
+static MemoryContext			worker_context = NULL;
 
-Oid jsonbc_dictionary_reloid = InvalidOid;
-Oid	jsonbc_keys_indoid = InvalidOid;
-Oid	jsonbc_id_indoid = InvalidOid;
+Oid jsonbc_dictionary_reloid	= InvalidOid;
+Oid	jsonbc_keys_indoid			= InvalidOid;
+Oid	jsonbc_id_indoid			= InvalidOid;
 
 void worker_main(Datum arg);
 static Oid jsonbc_get_dictionary_relid(void);
-static Oid get_extension_schema(void);
 
 #define JSONBC_DICTIONARY_REL	"jsonbc_dictionary"
 
@@ -47,7 +48,7 @@ static const char *sql_dictionary = "CREATE TABLE public." JSONBC_DICTIONARY_REL
 		  " (cmopt OID NOT NULL,"
 		  " id INT4	NOT NULL,"
 		  " key TEXT NOT NULL);"
-		  " CREATE UNIQUE INDEX jsonbc_dict_on_id ON " JSONBC_DICTIONARY_REL "(cmopt, id, key);"
+		  " CREATE UNIQUE INDEX jsonbc_dict_on_id ON " JSONBC_DICTIONARY_REL "(cmopt, id);"
 		  " CREATE UNIQUE INDEX jsonbc_dict_on_key ON " JSONBC_DICTIONARY_REL " (cmopt, key);";
 
 #define JSONBC_DICTIONARY_REL_ATT_CMOPT		1
@@ -143,13 +144,12 @@ jsonbc_register_worker(int n)
 }
 
 /* Returns buffers with keys ordered by ids */
-static char *
-jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys, size_t *reslen)
+static char **
+jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys)
 {
+	MemoryContext	old_mcxt;
 	int				i;
-	char		   *keys,
-				   *keyptr;
-	size_t			keyslen;
+	char		  **keys;
 
 	Oid			relid = jsonbc_get_dictionary_relid();
 	Relation	rel,
@@ -160,21 +160,16 @@ jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys, size_t *reslen)
 	rel = relation_open(relid, AccessShareLock);
 	idxrel = index_open(jsonbc_id_indoid, AccessShareLock);
 
-	/* preallocate the memory, we give 10 bytes for each word at first */
-	keyslen = nkeys * 10;
-	keyptr = keys = (char *) palloc(keyslen);
+	keys = (char **) MemoryContextAlloc(worker_context,
+										sizeof(char *) * nkeys);
 
 	for (i = 0; i < nkeys; i++)
 	{
-		char		   *key;
-		size_t			lenkey;
 		IndexScanDesc	scan;
 		ScanKeyData		skey[2];
 		Datum			key_datum;
 		HeapTuple		tup;
 		bool			isNull;
-
-		scan = index_beginscan(rel, idxrel, SnapshotAny, 2, 0);
 
 		ScanKeyInit(&skey[0],
 					JSONBC_DICTIONARY_REL_ATT_CMOPT,
@@ -187,6 +182,9 @@ jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys, size_t *reslen)
 					F_INT4EQ,
 					Int32GetDatum(ids[i]));
 
+		scan = index_beginscan(rel, idxrel, SnapshotAny, 2, 0);
+		index_rescan(scan, skey, 2, NULL, 0);
+
 		tup = index_getnext(scan, ForwardScanDirection);
 		if (tup == NULL)
 			elog(ERROR, "key not found for cmopt=%d and id=%d", cmoptoid, ids[i]);
@@ -195,18 +193,9 @@ jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys, size_t *reslen)
 							  RelationGetDescr(rel), &isNull);
 		Assert(isNull == false);
 
-		key = DatumGetCString(key_datum);
-		lenkey = strlen(key) + 1; /* include \0 */
-
-		/* increase buffer if we need to */
-		if ((keyptr - keys) + lenkey >= keyslen)
-		{
-			keyslen = keyslen * 2 + lenkey;
-			keys = (char *) repalloc(keys, keyslen);
-		}
-
-		memcpy(keyptr, key, lenkey);
-		keyptr += lenkey;
+		old_mcxt = MemoryContextSwitchTo(worker_context);
+		keys[i] = TextDatumGetCString(key_datum);
+		MemoryContextSwitchTo(old_mcxt);
 
 		index_endscan(scan);
 	}
@@ -215,8 +204,6 @@ jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys, size_t *reslen)
 	relation_close(rel, AccessShareLock);
 
 	finish_xact_command();
-
-	*reslen = keyptr - keys;
 	return keys;
 }
 
@@ -317,20 +304,20 @@ jsonbc_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
 	return (char *) idsbuf;
 }
 
-static char *
-jsonbc_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids, size_t *reslen)
+static char **
+jsonbc_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids)
 {
-	char		   *keys = NULL;
-	MemoryContext	old_mcxt = CurrentMemoryContext;;
+	char		  **keys = NULL;
+	MemoryContext	mcxt = CurrentMemoryContext;;
 
 	PG_TRY();
 	{
-		keys = jsonbc_get_keys_slow(cmoptoid, ids, nkeys, reslen);
+		keys = jsonbc_get_keys_slow(cmoptoid, ids, nkeys);
 	}
 	PG_CATCH();
 	{
 		ErrorData  *error;
-		MemoryContextSwitchTo(old_mcxt);
+		MemoryContextSwitchTo(mcxt);
 		error = CopyErrorData();
 		elog(LOG, "jsonbc: error occured: %s", error->message);
 		FlushErrorState();
@@ -344,7 +331,6 @@ jsonbc_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids, size_t *reslen)
 void
 worker_main(Datum arg)
 {
-	MemoryContext	worker_context;
 	shm_mq_handle  *mqh = NULL;
 
 	/* Establish signal handlers before unblocking signals */
@@ -384,9 +370,10 @@ worker_main(Datum arg)
 		{
 			JsonbcCommand	cmd;
 			Oid				cmoptoid;
-			shm_mq_iovec	iov;
+			shm_mq_iovec   *iov = NULL;
 			char		   *ptr = data;
 			int				nkeys = *((int *) ptr);
+			size_t			iovlen;
 
 			ptr += sizeof(int);
 			cmoptoid = *((Oid *) ptr);
@@ -397,24 +384,40 @@ worker_main(Datum arg)
 			switch (cmd)
 			{
 				case JSONBC_CMD_GET_IDS:
-					iov.data = jsonbc_cmd_get_ids(nkeys, cmoptoid, ptr, &iov.len);
+					iov = (shm_mq_iovec *) palloc(sizeof(shm_mq_iovec));
+					iovlen = 1;
+					iov->data = jsonbc_cmd_get_ids(nkeys, cmoptoid, ptr, &iov->len);
 					break;
 				case JSONBC_CMD_GET_KEYS:
-					iov.data = jsonbc_cmd_get_keys(nkeys, cmoptoid, (uint32 *) ptr, &iov.len);
-					if (iov.data == NULL)
+				{
+					char **keys = jsonbc_cmd_get_keys(nkeys, cmoptoid, (uint32 *) ptr);
+					if (keys != NULL)
 					{
-						iov.data = "";
-						iov.len = 1;
+						int i;
+
+						iov = (shm_mq_iovec *) palloc(sizeof(shm_mq_iovec) * nkeys);
+						iovlen = nkeys;
+						for (i = 0; i < nkeys; i++)
+						{
+							iov[i].data = keys[i];
+							iov[i].len = strlen(keys[i]) + 1;
+						}
 					}
+
 					break;
+				}
 				default:
 					elog(NOTICE, "jsonbc: got unknown command");
 			}
 
 			shm_mq_detach(mqh);
-
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
-			resmq = shm_mq_sendv(mqh, &iov, 1, false);
+
+			if (iov != NULL)
+				resmq = shm_mq_sendv(mqh, iov, iovlen, false);
+			else
+				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"\0", 1}), 1, false);
+
 			if (resmq != SHM_MQ_SUCCESS)
 				elog(NOTICE, "jsonbc: backend detached early");
 
@@ -487,16 +490,19 @@ jsonbc_get_dictionary_relid(void)
 		indexes = RelationGetIndexList(rel);
 		Assert(list_length(indexes) == 2);
 
-		/* FIXME: use smarter way to determine which is index is what */
 		foreach(lc, indexes)
 		{
 			Oid			indOid = lfirst_oid(lc);
 			Relation	indRel = index_open(indOid, NoLock);
+			int			attnum = indRel->rd_index->indkey.values[1];
 
-			if (indRel->rd_index->indnatts == 2)
+			if (attnum == JSONBC_DICTIONARY_REL_ATT_ID)
 				jsonbc_id_indoid = indOid;
 			else
+			{
+				Assert(attnum == JSONBC_DICTIONARY_REL_ATT_KEY);
 				jsonbc_keys_indoid = indOid;
+			}
 
 			index_close(indRel, NoLock);
 		}
@@ -512,44 +518,4 @@ jsonbc_get_dictionary_relid(void)
 
 	jsonbc_dictionary_reloid = relid;
 	return relid;
-}
-
-static Oid
-get_extension_schema(void)
-{
-	Oid				result;
-	Relation		rel;
-	SysScanDesc		scandesc;
-	HeapTuple		tuple;
-	ScanKeyData		entry[1];
-	Oid				ext_oid;
-
-	if (!IsTransactionState())
-		return InvalidOid;
-
-	ext_oid = get_extension_oid("jsonbc", true);
-	if (ext_oid == InvalidOid)
-		return InvalidOid;
-
-	ScanKeyInit(&entry[0],
-				ObjectIdAttributeNumber,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(ext_oid));
-
-	rel = heap_open(ExtensionRelationId, AccessShareLock);
-	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
-								  NULL, 1, entry);
-
-	tuple = systable_getnext(scandesc);
-
-	/* We assume that there can be at most one matching tuple */
-	if (HeapTupleIsValid(tuple))
-		result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
-	else
-		result = InvalidOid;
-
-	systable_endscan(scandesc);
-
-	heap_close(rel, AccessShareLock);
-	return result;
 }

@@ -71,7 +71,7 @@ static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
 static uint32 decode_varbyte(unsigned char *ptr);
 static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
 static void setup_guc_variables(void);
-static void jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, char **keys);
+static char *jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen);
 static void jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
 
 static size_t
@@ -278,16 +278,13 @@ ids_callback(char *res, size_t reslen, void *arg)
 
 typedef struct
 {
-	char **keys;
-	int	   nkeys;
+	size_t	 buflen;
+	char	*buf;
 } keys_callback_state;
 
 static bool
 keys_callback(char *res, size_t reslen, void *arg)
 {
-	int		i = 0,
-			nkeys = 0;
-
 	keys_callback_state *state = (keys_callback_state *) arg;
 
 	/* it should at least two symbols in the response */
@@ -302,16 +299,13 @@ keys_callback(char *res, size_t reslen, void *arg)
 		compression_buffers->buflen = reslen;
 	}
 
+	/* save the received data */
 	memcpy(compression_buffers->buf, res, reslen);
 
-	while (reslen--)
-	{
-		if (res[i] != '\0')
-			state->keys[nkeys++] = &compression_buffers->buf[i];
-		i++;
-	}
+	state->buf = compression_buffers->buf;
+	state->buflen = reslen;
 
-	return (nkeys == state->nkeys);
+	return true;
 }
 
 static void
@@ -392,13 +386,13 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkey
 	ids_callback_state	state;
 
 	iov[0].data = (void *) &nkeys;
-	iov[0].len = sizeof(int);
+	iov[0].len = sizeof(nkeys);
 
 	iov[1].data = (void *) &cmoptoid;
-	iov[1].len = sizeof(Oid);
+	iov[1].len = sizeof(cmoptoid);
 
 	iov[2].data = (void *) &cmd;
-	iov[2].len = sizeof(JsonbcCommand);
+	iov[2].len = sizeof(cmd);
 
 	iov[3].data = buf;
 	iov[3].len = buflen;
@@ -409,28 +403,31 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkey
 }
 
 /* Get keys by their IDs using workers */
-static void
-jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, char **keys)
+static char *
+jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen)
 {
 	JsonbcCommand		cmd = JSONBC_CMD_GET_KEYS;
 	shm_mq_iovec		iov[4];
 	keys_callback_state	state;
 
 	iov[0].data = (void *) &nkeys;
-	iov[0].len = sizeof(int);
+	iov[0].len = sizeof(nkeys);
 
 	iov[1].data = (void *) &cmoptoid;
-	iov[1].len = sizeof(Oid);
+	iov[1].len = sizeof(cmoptoid);
 
 	iov[2].data = (void *) &cmd;
-	iov[2].len = sizeof(JsonbcCommand);
+	iov[2].len = sizeof(cmd);
 
 	iov[3].data = (char *) ids;
 	iov[3].len = sizeof(uint32) * nkeys;
 
-	state.keys = keys;
-	state.nkeys = nkeys;
+	state.buf = NULL;
+	state.buflen = 0;
 	jsonbc_communicate(iov, 4, keys_callback, &state);
+
+	*buflen = state.buflen;
+	return state.buf;
 }
 
 /*
@@ -698,7 +695,7 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 	JsonbParseState	   *state = NULL;
 	struct varlena	   *res;
 
-	init_memory_context(false);
+	init_memory_context(true);
 	Assert(VARATT_IS_CUSTOM_COMPRESSED(data));
 
 	jb = (Jsonb *) ((char *) data + VARHDRSZ_CUSTOM_COMPRESSED - offsetof(Jsonb, root));
@@ -709,7 +706,9 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 
 		if (r == WJB_END_OBJECT && jbv->type == jbvObject)
 		{
-			char  **keys;
+			char   *buf;
+			size_t	buflen,
+					offset = 0;
 			int		i,
 					nkeys = jbv->val.object.nPairs;
 
@@ -721,7 +720,7 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 				compression_buffers->idslen = nkeys;
 			}
 
-			/* decode keys */
+			/* decode key ids */
 			for (i = 0; i < nkeys; i++)
 			{
 				int32		key_id;
@@ -733,18 +732,24 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 				compression_buffers->idsbuf[i] = key_id;
 			}
 
-			/* retrieve or generate ids */
-			keys = (char **) palloc(sizeof(char *) * nkeys);
-			jsonbc_get_keys(ac->cmoptoid, compression_buffers->idsbuf, nkeys, keys);
+			/* retrieve keys */
+			buf = jsonbc_get_keys(ac->cmoptoid, compression_buffers->idsbuf, nkeys, &buflen);
+			if (buf == NULL)
+				elog(ERROR, "jsonbc: decompression error");
 
 			/* replace the encoded keys with real keys */
 			for (i = 0; i < nkeys; i++)
 			{
+				size_t	oldoff = offset;
+
 				JsonbValue *v = &jbv->val.object.pairs[i].key;
-				v->val.string.val = keys[i];
-				v->val.string.len = strlen(keys[i]);
+				v->val.string.val = &buf[offset];
+				while (buf[offset++] != '\0');
+				v->val.string.len = offset - oldoff - 2;
 			}
-			pfree(keys);
+
+			/* check correctness */
+			Assert(offset == buflen);
 		}
 	}
 
