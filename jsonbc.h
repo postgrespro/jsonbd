@@ -36,4 +36,7 @@ extern int jsonbc_nworkers;
 extern int jsonbc_cache_size;
 extern int jsonbc_queue_size;
 
+extern void shm_mq_clean_receiver(shm_mq *mq);
+extern void shm_mq_clean_sender(shm_mq *mq);
+
 #endif

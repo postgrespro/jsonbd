@@ -71,18 +71,16 @@ static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
 static uint32 decode_varbyte(unsigned char *ptr);
 static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
 static void setup_guc_variables(void);
-static void shm_mq_clean_sender(shm_mq *mq);
-static void shm_mq_clean_receiver(shm_mq *mq);
 static void jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, char **keys);
 static void jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
 
-static inline Size
+static size_t
 jsonbc_get_queue_size(void)
 {
 	return (Size) (jsonbc_queue_size * 1024);
 }
 
-static void
+void
 shm_mq_clean_sender(shm_mq *mq)
 {
 	struct shm_mq_alt	*amq = (struct shm_mq_alt *) mq;
@@ -95,7 +93,7 @@ shm_mq_clean_sender(shm_mq *mq)
 	amq->mq_detached = false;
 }
 
-static void
+void
 shm_mq_clean_receiver(shm_mq *mq)
 {
 	struct shm_mq_alt	*amq = (struct shm_mq_alt *) mq;
@@ -346,12 +344,6 @@ again:
 		if (resmq != SHM_MQ_SUCCESS)
 			detached = true;
 		shm_mq_detach(mqh);
-
-		/*
-		 * we need to clean sender before receiving, because we need to block
-		 * worker after we received data
-		 */
-		shm_mq_clean_sender(wd->mqin);
 
 		/* get data */
 		if (!detached)

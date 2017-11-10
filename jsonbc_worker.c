@@ -12,6 +12,7 @@
 #include "access/sysattr.h"
 #include "catalog/pg_extension.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "port/atomics.h"
@@ -154,6 +155,8 @@ jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys, size_t *reslen)
 	Relation	rel,
 				idxrel;
 
+	start_xact_command();
+
 	rel = relation_open(relid, AccessShareLock);
 	idxrel = index_open(jsonbc_id_indoid, AccessShareLock);
 
@@ -211,6 +214,8 @@ jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys, size_t *reslen)
 	index_close(idxrel, AccessShareLock);
 	relation_close(rel, AccessShareLock);
 
+	finish_xact_command();
+
 	*reslen = keyptr - keys;
 	return keys;
 }
@@ -226,8 +231,8 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 
 	int		i;
 	Oid		relid = jsonbc_get_dictionary_relid();
-	char   *nspc = get_namespace_name(get_extension_schema());
 
+	start_xact_command();
 	rel = relation_open(relid, ShareLock);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -239,8 +244,8 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		bool		isnull;
 		char	   *sql;
 
-		sql = psprintf("SELECT id FROM %s.jsonbc_dictionary WHERE cmopt = %d"
-					   "	AND key = '%s'", nspc, cmoptoid, buf);
+		sql = psprintf("SELECT id FROM public.jsonbc_dictionary WHERE cmopt = %d"
+					   "	AND key = '%s'", cmoptoid, buf);
 
 		if (SPI_exec(sql, 0) != SPI_OK_SELECT)
 			elog(ERROR, "SPI_exec failed");
@@ -248,9 +253,9 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		if (SPI_processed == 0)
 		{
 			char *sql2 = psprintf("with t as (select (coalesce(max(id), 0) + 1) new_id from "
-						"%s.jsonbc_dictionary where cmopt = %d) insert into %s.jsonbc_dictionary"
+						"public.jsonbc_dictionary where cmopt = %d) insert into public.jsonbc_dictionary"
 						" select %d, t.new_id, '%s' from t returning id",
-						nspc, cmoptoid, nspc, cmoptoid, buf);
+						cmoptoid, cmoptoid, buf);
 
 			if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
 				elog(ERROR, "SPI_exec failed");
@@ -274,6 +279,7 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 	}
 	SPI_finish();
 	relation_close(rel, ShareLock);
+	finish_xact_command();
 }
 
 static char *
@@ -296,7 +302,7 @@ jsonbc_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
 		ErrorData  *error;
 		MemoryContextSwitchTo(old_mcxt);
 		error = CopyErrorData();
-		elog(LOG, "jsonbc: error occured %s", error->message);
+		elog(LOG, "jsonbc: error occured: %s", error->message);
 		FlushErrorState();
 		pfree(error);
 
@@ -316,16 +322,14 @@ jsonbc_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids, size_t *reslen)
 
 	PG_TRY();
 	{
-		start_xact_command();
 		keys = jsonbc_get_keys_slow(cmoptoid, ids, nkeys, reslen);
-		finish_xact_command();
 	}
 	PG_CATCH();
 	{
 		ErrorData  *error;
 		MemoryContextSwitchTo(old_mcxt);
 		error = CopyErrorData();
-		elog(LOG, "jsonbc: error occured %s", error->message);
+		elog(LOG, "jsonbc: error occured: %s", error->message);
 		FlushErrorState();
 		pfree(error);
 	}
@@ -399,11 +403,13 @@ worker_main(Datum arg)
 						iov.data = "";
 						iov.len = 1;
 					}
+					break;
 				default:
 					elog(NOTICE, "jsonbc: got unknown command");
 			}
 
 			shm_mq_detach(mqh);
+			shm_mq_clean_sender(worker_state->mqin);
 
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
 			resmq = shm_mq_sendv(mqh, &iov, 1, false);
@@ -436,24 +442,32 @@ worker_main(Datum arg)
 static Oid
 jsonbc_get_dictionary_relid(void)
 {
-	Oid relid;
+	Oid relid,
+		nspoid;
 
 	if (OidIsValid(jsonbc_dictionary_reloid))
 		return jsonbc_dictionary_reloid;
 
-	relid = get_relname_relid(JSONBC_DICTIONARY_REL, InvalidOid);
+	start_xact_command();
+
+	nspoid = get_namespace_oid("public", false);
+	relid = get_relname_relid(JSONBC_DICTIONARY_REL, nspoid);
 	if (relid == InvalidOid)
 	{
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
 
-		if (SPI_exec(sql_dictionary, 0) != SPI_OK_UTILITY)
+		if (SPI_execute(sql_dictionary, false, 0) != SPI_OK_UTILITY)
 			elog(ERROR, "could not create \"jsonbc\" dictionary");
 
 		SPI_finish();
+		CommandCounterIncrement();
+
+		finish_xact_command();
+		start_xact_command();
 
 		/* get just created table Oid */
-		relid = get_relname_relid(JSONBC_DICTIONARY_REL, InvalidOid);
+		relid = get_relname_relid(JSONBC_DICTIONARY_REL, nspoid);
 		jsonbc_id_indoid = InvalidOid;
 		jsonbc_keys_indoid = InvalidOid;
 	}
@@ -486,6 +500,8 @@ jsonbc_get_dictionary_relid(void)
 		}
 		relation_close(rel, NoLock);
 	}
+
+	finish_xact_command();
 
 	/* check we did fill global variables */
 	Assert(OidIsValid(jsonbc_id_indoid));
