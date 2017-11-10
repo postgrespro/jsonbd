@@ -250,6 +250,8 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		if (SPI_exec(sql, 0) != SPI_OK_SELECT)
 			elog(ERROR, "SPI_exec failed");
 
+		pfree(sql);
+
 		if (SPI_processed == 0)
 		{
 			char *sql2 = psprintf("with t as (select (coalesce(max(id), 0) + 1) new_id from "
@@ -259,6 +261,8 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 
 			if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
 				elog(ERROR, "SPI_exec failed");
+
+			pfree(sql2);
 		}
 
 		datum = SPI_getbinval(SPI_tuptable->vals[0],
@@ -275,7 +279,6 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 			buf++;
 
 		buf++;
-		pfree(sql);
 	}
 	SPI_finish();
 	relation_close(rel, ShareLock);
@@ -382,7 +385,7 @@ worker_main(Datum arg)
 			JsonbcCommand	cmd;
 			Oid				cmoptoid;
 			shm_mq_iovec	iov;
-			char			*ptr = data;
+			char		   *ptr = data;
 			int				nkeys = *((int *) ptr);
 
 			ptr += sizeof(int);
@@ -409,7 +412,6 @@ worker_main(Datum arg)
 			}
 
 			shm_mq_detach(mqh);
-			shm_mq_clean_sender(worker_state->mqin);
 
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
 			resmq = shm_mq_sendv(mqh, &iov, 1, false);

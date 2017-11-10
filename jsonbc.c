@@ -150,6 +150,7 @@ jsonbc_shmem_startup_hook(void)
 		toc = shm_toc_create(JSONBC_SHM_MQ_MAGIC, workers_data, size);
 		hdr = shm_toc_allocate(toc, sizeof(jsonbc_shm_hdr));
 		hdr->workers_ready = 0;
+		sem_init(&hdr->workers_sem, 1, jsonbc_nworkers);
 		shm_toc_insert(toc, 0, hdr);
 		mqkey = jsonbc_nworkers + 1;
 
@@ -322,6 +323,7 @@ jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
 	bool				callback_succeded = false;
 	shm_mq_result		resmq;
 	shm_mq_handle	   *mqh;
+	jsonbc_shm_hdr	   *hdr;
 
 	char			   *res;
 	Size				reslen;
@@ -330,7 +332,9 @@ jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
 		/* TODO: maybe add support of multiple databases for dictionaries */
 		elog(ERROR, "jsonbc workers are not available");
 
-again:
+	hdr = shm_toc_lookup(toc, 0, false);
+	sem_wait(&hdr->workers_sem);
+
 	for (i = 0; i < jsonbc_nworkers; i++)
 	{
 		jsonbc_shm_worker *wd = shm_toc_lookup(toc, i + 1, false);
@@ -339,6 +343,8 @@ again:
 
 		/* send data */
 		shm_mq_set_sender(wd->mqin, MyProc);
+		shm_mq_set_receiver(wd->mqout, MyProc);
+
 		mqh = shm_mq_attach(wd->mqin, NULL, NULL);
 		resmq = shm_mq_sendv(mqh, iov, iov_len, false);
 		if (resmq != SHM_MQ_SUCCESS)
@@ -348,7 +354,6 @@ again:
 		/* get data */
 		if (!detached)
 		{
-			shm_mq_set_receiver(wd->mqout, MyProc);
 			mqh = shm_mq_attach(wd->mqout, NULL, NULL);
 			resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
 			if (resmq != SHM_MQ_SUCCESS)
@@ -361,6 +366,7 @@ again:
 		}
 
 		/* clean self as receiver and unlock mq */
+		shm_mq_clean_sender(wd->mqin);
 		shm_mq_clean_receiver(wd->mqout);
 		pg_atomic_clear_flag(&wd->busy);
 
@@ -371,14 +377,10 @@ again:
 			elog(ERROR, "jsonbc: communication error");
 
 		/* we're done here */
-		return;
+		break;
 	}
 
-	CHECK_FOR_INTERRUPTS();
-	pg_usleep(100);
-
-	/* TODO: add attempts count check */
-	goto again;
+	sem_post(&hdr->workers_sem);
 }
 
 /* Get key IDs using workers */

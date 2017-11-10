@@ -2,6 +2,7 @@
 #define JSONBC_H
 
 #include <postgres.h>
+#include <semaphore.h>
 
 #include "port/atomics.h"
 #include "storage/proc.h"
@@ -17,7 +18,8 @@ typedef enum {
 
 typedef struct jsonbc_shm_hdr
 {
-	volatile int workers_ready;
+	sem_t			workers_sem;
+	volatile int	workers_ready;
 } jsonbc_shm_hdr;
 
 typedef struct jsonbc_shm_worker
