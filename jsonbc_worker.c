@@ -11,6 +11,7 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_compression_opt.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "commands/extension.h"
@@ -44,16 +45,20 @@ static Oid jsonbc_get_dictionary_relid(void);
 
 #define JSONBC_DICTIONARY_REL	"jsonbc_dictionary"
 
-static const char *sql_dictionary = "CREATE TABLE public." JSONBC_DICTIONARY_REL
-		  " (cmopt OID NOT NULL,"
-		  " id INT4	NOT NULL,"
-		  " key TEXT NOT NULL);"
-		  " CREATE UNIQUE INDEX jsonbc_dict_on_id ON " JSONBC_DICTIONARY_REL "(cmopt, id);"
-		  " CREATE UNIQUE INDEX jsonbc_dict_on_key ON " JSONBC_DICTIONARY_REL " (cmopt, key);";
+static const char *sql_dictionary = \
+	"CREATE TABLE public." JSONBC_DICTIONARY_REL
+	" (cmopt	OID NOT NULL,"
+	"  id		INT4 NOT NULL,"
+	"  key		TEXT NOT NULL);"
+	"CREATE UNIQUE INDEX jsonbc_dict_on_id ON " JSONBC_DICTIONARY_REL "(cmopt, id);"
+	"CREATE UNIQUE INDEX jsonbc_dict_on_key ON " JSONBC_DICTIONARY_REL " (cmopt, key);";
 
-#define JSONBC_DICTIONARY_REL_ATT_CMOPT		1
-#define JSONBC_DICTIONARY_REL_ATT_ID		2
-#define JSONBC_DICTIONARY_REL_ATT_KEY		3
+enum {
+	JSONBC_DICTIONARY_REL_ATT_CMOPT = 1,
+	JSONBC_DICTIONARY_REL_ATT_ID,
+	JSONBC_DICTIONARY_REL_ATT_KEY,
+	JSONBC_DICTIONARY_REL_ATT_COUNT
+};
 
 /*
  * Handle SIGTERM in BGW's process.
@@ -205,6 +210,92 @@ jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys)
 
 	finish_xact_command();
 	return keys;
+}
+
+static void
+jsonbc_bulk_insert_keys(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
+{
+	Oid		relid = jsonbc_get_dictionary_relid();
+	Relation rel;
+
+	int			i,
+				counter,
+				hi_options;
+	HeapTuple  *buffered;
+	Datum		values[JSONBC_DICTIONARY_REL_ATT_COUNT];
+	Datum		nulls[JSONBC_DICTIONARY_REL_ATT_COUNT];
+	BulkInsertState	bistate;
+	TupleTableSlot	*myslot;
+	ResultRelInfo *resultRelInfo;
+	ExprContext *econtext;
+	EState	   *estate = CreateExecutorState();
+	MemoryContext oldcontext = CurrentMemoryContext;
+
+	start_xact_command();
+	rel = heap_open(relid, RowExclusiveLock);
+	bistate = GetBulkInsertState();
+	myslot = MakeTupleTableSlot();
+	ExecSetSlotDescriptor(myslot, RelationGetDescr(rel));
+
+	/* we need resultRelInfo to insert to indexes */
+	resultRelInfo = makeNode(ResultRelInfo);
+	InitResultRelInfo(resultRelInfo, rel, 1, NULL, 0);
+
+	ExecOpenIndices(resultRelInfo, false);
+	MemSet(values, 0, sizeof(values));
+	MemSet(nulls, 0, sizeof(nulls));
+
+	/* only one process can insert to dictionary at same time */
+	LockDatabaseObject(relid, cmoptoid, 0, ExclusiveLock);
+
+	buffered = palloc(sizeof(HeapTuple) * nkeys);
+	for (i = 0; i < nkeys; i++)
+	{
+		HeapTuple	tuple;
+
+		values[JSONBC_DICTIONARY_REL_ATT_CMOPT - 1] = ObjectIdGetDatum(cmoptoid);
+		values[JSONBC_DICTIONARY_REL_ATT_ID - 1] = Int32GetDatum(counter++);
+		values[JSONBC_DICTIONARY_REL_ATT_KEY - 1] = CStringGetTextDatum(buf);
+
+		tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+		tuple->t_tableOid = relid;
+
+		buffered[i] = tuple;
+
+		/* move to next key */
+		while (*buf != '\0')
+			buf++;
+
+		buf++;
+	}
+
+	if (!XLogIsNeeded())
+		hi_options |= HEAP_INSERT_SKIP_WAL;
+
+	heap_multi_insert(rel,
+					  buffered,
+					  nkeys,
+					  mycid,
+					  hi_options,
+					  bistate);
+
+	/* update indexes */
+	for (i = 0; i < nkeys; i++)
+	{
+		List	   *recheckIndexes;
+
+		ExecStoreTuple(buffered[i], myslot, InvalidBuffer, false);
+		recheckIndexes =
+			ExecInsertIndexTuples(myslot, &(buffered[i]->t_self),
+								  estate, false, NULL, NIL);
+		list_free(recheckIndexes);
+	}
+
+	UnlockDatabaseObject(relid, cmoptoid, 0, ExclusiveLock);
+
+	FreeBulkInsertState(bistate);
+	heap_close(rel, RowExclusiveLock);
+	finish_xact_command();
 }
 
 /*

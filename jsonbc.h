@@ -30,6 +30,16 @@ typedef struct jsonbc_shm_worker
 	PGPROC			   *proc;
 } jsonbc_shm_worker;
 
+typedef struct jsonbc_cached_cmopt
+{
+	HTAB	*keys;
+} cmopt_cached;
+
+typedef struct jsonbc_cached_key
+{
+	HTAB *
+}
+
 extern void _PG_init(void);
 extern void jsonbc_register_worker(int n);
 
