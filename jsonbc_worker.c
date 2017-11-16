@@ -35,6 +35,8 @@ static bool						xact_started = false;
 static bool						shutdown_requested = false;
 static jsonbc_shm_worker	   *worker_state;
 static MemoryContext			worker_context = NULL;
+static MemoryContext			worker_cache_context = NULL;
+static HTAB					   *cmcache;
 
 Oid jsonbc_dictionary_reloid	= InvalidOid;
 Oid	jsonbc_keys_indoid			= InvalidOid;
@@ -76,9 +78,43 @@ handle_sigterm(SIGNAL_ARGS)
 	errno = save_errno;
 }
 
+/* Returns an item from compression options cache */
+static jsonbc_cached_cmopt *
+get_cached_compression_options(Oid cmoptoid)
+{
+	bool	found;
+	jsonbc_cached_cmopt *cmdata;
+
+	cmdata = hash_search(cmcache, &cmoptoid, HASH_ENTER, &found);
+	if (!found)
+	{
+		HASHCTL		hash_ctl;
+
+		memset(&hash_ctl, 0, sizeof(hash_ctl));
+		hash_ctl.keysize = sizeof(uint32);
+		hash_ctl.entrysize = sizeof(jsonbc_cached_key);
+		hash_ctl.hcxt = worker_cache_context;
+
+		cmdata->cmoptoid = cmoptoid;
+		cmdata->key_cache = hash_create("jsonbc map by key",
+							  128,
+							  &hash_ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+		hash_ctl.entrysize = sizeof(jsonbc_cached_id);
+		cmdata->id_cache = hash_create("jsonbc map by id",
+							  128,
+							  &hash_ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	return cmdata;
+}
+
 static void
 init_local_variables(int worker_num)
 {
+	HASHCTL		hash_ctl;
+
 	shm_toc		   *toc = shm_toc_attach(JSONBC_SHM_MQ_MAGIC, workers_data);
 	jsonbc_shm_hdr *hdr = shm_toc_lookup(toc, 0, false);
 	hdr->workers_ready++;
@@ -94,6 +130,29 @@ init_local_variables(int worker_num)
 
 	/* not busy at start */
 	pg_atomic_clear_flag(&worker_state->busy);
+
+	/* this context will be reset after each task */
+	Assert(worker_context == NULL);
+	worker_context = AllocSetContextCreate(TopMemoryContext,
+										   "jsonbc worker context",
+										   ALLOCSET_DEFAULT_MINSIZE,
+										   ALLOCSET_DEFAULT_INITSIZE,
+										   ALLOCSET_DEFAULT_MAXSIZE);
+
+	worker_cache_context = AllocSetContextCreate(TopMemoryContext,
+										"jsonbc worker cache context",
+										ALLOCSET_DEFAULT_SIZES);
+
+	/* Initialize hash tables used to track update chains */
+	memset(&hash_ctl, 0, sizeof(hash_ctl));
+	hash_ctl.keysize = sizeof(Oid);
+	hash_ctl.entrysize = sizeof(jsonbc_cached_cmopt);
+	hash_ctl.hcxt = worker_cache_context;
+
+	cmcache = hash_create("jsonbc compression options cache",
+						  128,		/* arbitrary initial size */
+						  &hash_ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	elog(LOG, "jsonbc dictionary worker %d started with pid: %d",
 			worker_num + 1, MyProcPid);
@@ -233,9 +292,12 @@ jsonbc_bulk_insert_keys(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 
 	start_xact_command();
 	rel = heap_open(relid, RowExclusiveLock);
+
+	/* setup states */
 	bistate = GetBulkInsertState();
 	myslot = MakeTupleTableSlot();
 	ExecSetSlotDescriptor(myslot, RelationGetDescr(rel));
+	add_range_table_to_estate(estate, rel);
 
 	/* we need resultRelInfo to insert to indexes */
 	resultRelInfo = makeNode(ResultRelInfo);
@@ -437,11 +499,6 @@ worker_main(Datum arg)
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbc_worker");
 	init_local_variables(DatumGetInt32(arg));
 
-	worker_context = AllocSetContextCreate(TopMemoryContext,
-										   "jsonbc worker context",
-										   ALLOCSET_DEFAULT_MINSIZE,
-										   ALLOCSET_DEFAULT_INITSIZE,
-										   ALLOCSET_DEFAULT_MAXSIZE);
 	MemoryContextSwitchTo(worker_context);
 
 	while (true)

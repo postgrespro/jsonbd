@@ -30,15 +30,31 @@ typedef struct jsonbc_shm_worker
 	PGPROC			   *proc;
 } jsonbc_shm_worker;
 
+typedef struct jsonbc_pair
+{
+	int32	 id;
+	char	*key;
+} jsonbc_pair;
+
 typedef struct jsonbc_cached_cmopt
 {
-	HTAB	*keys;
-} cmopt_cached;
+	Oid		 cmoptoid;
+	HTAB	*key_cache;
+	HTAB	*id_cache;
+} jsonbc_cached_opt;
 
 typedef struct jsonbc_cached_key
 {
-	HTAB *
-}
+	uint32	 keyhash;
+	uint32	 pairslen;
+	jsonbc_pair	**pairs;	/* for hash collisions */
+} jsonbc_cached_key;
+
+typedef struct jsonbc_cached_id
+{
+	uint32	 id;
+	jsonbc_pair	*pair;
+} jsonbc_cached_id;
 
 extern void _PG_init(void);
 extern void jsonbc_register_worker(int n);
@@ -47,8 +63,5 @@ extern void *workers_data;
 extern int jsonbc_nworkers;
 extern int jsonbc_cache_size;
 extern int jsonbc_queue_size;
-
-extern void shm_mq_clean_receiver(shm_mq *mq);
-extern void shm_mq_clean_sender(shm_mq *mq);
 
 #endif

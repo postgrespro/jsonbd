@@ -36,23 +36,6 @@ typedef struct
 	MemoryContext	item_mcxt;
 } CompressionThroughBuffers;
 
-#if PG_VERSION_NUM == 110000
-struct shm_mq_alt
-{
-	slock_t		mq_mutex;
-	PGPROC	   *mq_receiver;	/* this one */
-	PGPROC	   *mq_sender;		/* this one */
-	uint64		mq_bytes_read;
-	uint64		mq_bytes_written;
-	Size		mq_ring_size;
-	bool		mq_detached;	/* and this one */
-
-	/* in postgres version there are more attributes, but we don't need them */
-};
-#else
-#error "shm_mq struct in jsonbc is copied from PostgreSQL 11, please correct it according to your version"
-#endif
-
 /* local */
 static MemoryContext compression_mcxt = NULL;
 static CompressionThroughBuffers *compression_buffers = NULL;
@@ -68,42 +51,16 @@ int jsonbc_queue_size = 0;
 static void init_memory_context(bool);
 static void memory_reset_callback(void *arg);
 static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
-static uint32 decode_varbyte(unsigned char *ptr);
 static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
 static void setup_guc_variables(void);
 static char *jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen);
 static void jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
+static uint32 decode_varbyte(unsigned char *ptr);
 
 static size_t
 jsonbc_get_queue_size(void)
 {
 	return (Size) (jsonbc_queue_size * 1024);
-}
-
-void
-shm_mq_clean_sender(shm_mq *mq)
-{
-	struct shm_mq_alt	*amq = (struct shm_mq_alt *) mq;
-
-	/* check that attributes are same and our struct still compatible with global shm_mq */
-	Assert(shm_mq_get_sender(mq) == amq->mq_sender);
-	Assert(shm_mq_get_receiver(mq) == amq->mq_receiver);
-
-	amq->mq_sender = NULL;
-	amq->mq_detached = false;
-}
-
-void
-shm_mq_clean_receiver(shm_mq *mq)
-{
-	struct shm_mq_alt	*amq = (struct shm_mq_alt *) mq;
-
-	/* check that attributes are same and our struct still compatible with global shm_mq */
-	Assert(shm_mq_get_sender(mq) == amq->mq_sender);
-	Assert(shm_mq_get_receiver(mq) == amq->mq_receiver);
-
-	amq->mq_receiver = NULL;
-	amq->mq_detached = false;
 }
 
 static size_t
@@ -131,7 +88,6 @@ jsonbc_shmem_size(void)
 static void
 jsonbc_shmem_startup_hook(void)
 {
-	int				mqkey;
 	bool			found;
 	Size			size = jsonbc_shmem_size();
 	jsonbc_shm_hdr *hdr;
@@ -146,6 +102,7 @@ jsonbc_shmem_startup_hook(void)
 	if (!found)
 	{
 		int i;
+		int	mqkey;
 
 		toc = shm_toc_create(JSONBC_SHM_MQ_MAGIC, workers_data, size);
 		hdr = shm_toc_allocate(toc, sizeof(jsonbc_shm_hdr));
