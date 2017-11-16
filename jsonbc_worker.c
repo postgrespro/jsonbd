@@ -225,12 +225,12 @@ jsonbc_get_key(Relation rel, Relation indrel, Oid cmoptoid, uint32 key_id)
 	char		   *res;
 
 	ScanKeyInit(&skey[0],
-				JSONBC_DICTIONARY_REL_ATT_CMOPT,
+				1,
 				BTEqualStrategyNumber,
 				F_OIDEQ,
 				ObjectIdGetDatum(cmoptoid));
 	ScanKeyInit(&skey[1],
-				JSONBC_DICTIONARY_REL_ATT_ID,
+				2,
 				BTEqualStrategyNumber,
 				F_INT4EQ,
 				Int32GetDatum(key_id));
@@ -327,12 +327,12 @@ jsonbc_get_key_id(Relation rel, Relation indrel, Oid cmoptoid, char *key)
 	uint32			result = 0;
 
 	ScanKeyInit(&skey[0],
-				JSONBC_DICTIONARY_REL_ATT_CMOPT,
+				1,
 				BTEqualStrategyNumber,
 				F_OIDEQ,
 				ObjectIdGetDatum(cmoptoid));
 	ScanKeyInit(&skey[1],
-				JSONBC_DICTIONARY_REL_ATT_KEY,
+				2,
 				BTEqualStrategyNumber,
 				F_TEXTEQ,
 				CStringGetTextDatum(key));
@@ -360,6 +360,7 @@ static void
 jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 {
 	Relation	rel = NULL;
+	Relation	indrel;
 	int			i;
 	Oid			relid = jsonbc_get_dictionary_relid();
 	bool		spi_on = false;
@@ -371,7 +372,6 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 	{
 		uint32		hkey;
 		bool		found;
-		Relation	indrel;
 		MemoryContext	oldcontext;
 		jsonbc_cached_key		*ckey;
 		jsonbc_pair				*pair;
@@ -409,9 +409,9 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		{
 			start_xact_command();
 			rel = relation_open(relid, AccessShareLock);
+			indrel = index_open(jsonbc_keys_indoid, AccessShareLock);
 		}
 
-		indrel = index_open(jsonbc_keys_indoid, AccessShareLock);
 		idsbuf[i] = jsonbc_get_key_id(rel, indrel, cmoptoid, buf);
 
 		if (idsbuf[i] == 0)
@@ -452,17 +452,13 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 			}
 			index_close(indrel2, ExclusiveLock);
 		}
-		index_close(indrel, AccessShareLock);
 
 		pair->id = idsbuf[i];
 next:
 		Assert(idsbuf[i] > 0);
 
 		/* move to next key */
-		while (*buf != '\0')
-			buf++;
-
-		buf++;
+		while (*buf++ != '\0');
 	}
 
 	if (spi_on)
@@ -470,6 +466,7 @@ next:
 
 	if (rel)
 	{
+		index_close(indrel, AccessShareLock);
 		relation_close(rel, AccessShareLock);
 		finish_xact_command();
 	}

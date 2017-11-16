@@ -276,6 +276,7 @@ jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
 	shm_mq_result		resmq;
 	shm_mq_handle	   *mqh;
 	jsonbc_shm_hdr	   *hdr;
+	jsonbc_shm_worker  *wd;
 
 	char			   *res;
 	Size				reslen;
@@ -289,50 +290,53 @@ jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
 
 	for (i = 0; i < jsonbc_nworkers; i++)
 	{
-		jsonbc_shm_worker *wd = shm_toc_lookup(toc, i + 1, false);
-		if (!pg_atomic_test_set_flag(&wd->busy))
-			continue;
-
-		/* send data */
-		shm_mq_set_sender(wd->mqin, MyProc);
-		shm_mq_set_receiver(wd->mqout, MyProc);
-
-		mqh = shm_mq_attach(wd->mqin, NULL, NULL);
-		resmq = shm_mq_sendv(mqh, iov, iov_len, false);
-		if (resmq != SHM_MQ_SUCCESS)
-			detached = true;
-		shm_mq_detach(mqh);
-
-		/* get data */
-		if (!detached)
-		{
-			mqh = shm_mq_attach(wd->mqout, NULL, NULL);
-			resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
-			if (resmq != SHM_MQ_SUCCESS)
-				detached = true;
-
-			if (!detached)
-				callback_succeded = callback(res, reslen, callback_arg);
-
-			shm_mq_detach(mqh);
-		}
-
-		/* clean self as receiver and unlock mq */
-		shm_mq_clean_sender(wd->mqin);
-		shm_mq_clean_receiver(wd->mqout);
-		pg_atomic_clear_flag(&wd->busy);
-
-		if (detached)
-			elog(ERROR, "jsonbc: worker has detached");
-
-		if (!callback_succeded)
-			elog(ERROR, "jsonbc: communication error");
-
-		/* we're done here */
-		break;
+		wd = shm_toc_lookup(toc, i + 1, false);
+		if (pg_atomic_test_set_flag(&wd->busy))
+			break;
 	}
 
+	if (i == jsonbc_nworkers)
+	{
+		sem_post(&hdr->workers_sem);
+		elog(ERROR, "jsonbc: could not make a connection with workers");
+	}
+
+	/* send data */
+	shm_mq_set_sender(wd->mqin, MyProc);
+	shm_mq_set_receiver(wd->mqout, MyProc);
+
+	mqh = shm_mq_attach(wd->mqin, NULL, NULL);
+	resmq = shm_mq_sendv(mqh, iov, iov_len, false);
+	if (resmq != SHM_MQ_SUCCESS)
+		detached = true;
+	shm_mq_detach(mqh);
+
+	/* get data */
+	if (!detached)
+	{
+		mqh = shm_mq_attach(wd->mqout, NULL, NULL);
+		resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
+		if (resmq != SHM_MQ_SUCCESS)
+			detached = true;
+
+		if (!detached)
+			callback_succeded = callback(res, reslen, callback_arg);
+
+		shm_mq_detach(mqh);
+	}
+
+	/* clean self as receiver and unlock mq */
+	shm_mq_clean_sender(wd->mqin);
+	shm_mq_clean_receiver(wd->mqout);
+	pg_atomic_clear_flag(&wd->busy);
 	sem_post(&hdr->workers_sem);
+
+	if (detached)
+		elog(ERROR, "jsonbc: worker has detached");
+
+	if (!callback_succeded)
+		elog(ERROR, "jsonbc: communication error");
+
 }
 
 /* Get key IDs using workers */
