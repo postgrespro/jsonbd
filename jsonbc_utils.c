@@ -3,6 +3,8 @@
 
 #include "postgres.h"
 #include "nodes/execnodes.h"
+#include "nodes/makefuncs.h"
+#include "utils/rel.h"
 
 #if PG_VERSION_NUM == 110000
 struct shm_mq_alt
@@ -26,8 +28,6 @@ add_range_table_to_estate(EState *estate, Relation rel)
 {
 	RangeTblEntry *rte = makeNode(RangeTblEntry);
 	char	   *refname = RelationGetRelationName(rel);
-
-	Assert(pstate != NULL);
 
 	rte->rtekind = RTE_RELATION;
 	rte->alias = NULL;
@@ -74,11 +74,11 @@ add_range_table_to_estate(EState *estate, Relation rel)
  */
 uint32 qhashmurmur3_32(const void *data, size_t nbytes)
 {
-    int i;
-    uint32 k;
-    const int nblocks;
-    const uint32 *blocks;
-    const uint8 *tail;
+    int		i,
+			nblocks;
+    uint32	k;
+    uint32 *blocks;
+    uint8  *tail;
 
     const uint32 c1 = 0xcc9e2d51;
     const uint32 c2 = 0x1b873593;
@@ -88,8 +88,8 @@ uint32 qhashmurmur3_32(const void *data, size_t nbytes)
 	Assert(data != NULL && nbytes > 0);
 
     nblocks = nbytes / 4;
-    blocks = (const uint32 *) (data);
-    tail = (const uint8 *) (data + (nblocks * 4));
+    blocks = (uint32 *) (data);
+    tail = (uint8 *) ((char *) data + (nblocks * 4));
 
     for (i = 0; i < nblocks; i++)
 	{

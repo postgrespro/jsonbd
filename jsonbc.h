@@ -4,6 +4,7 @@
 #include <postgres.h>
 #include <semaphore.h>
 
+#include "nodes/pg_list.h"
 #include "port/atomics.h"
 #include "storage/proc.h"
 #include "storage/shm_mq.h"
@@ -41,13 +42,12 @@ typedef struct jsonbc_cached_cmopt
 	Oid		 cmoptoid;
 	HTAB	*key_cache;
 	HTAB	*id_cache;
-} jsonbc_cached_opt;
+} jsonbc_cached_cmopt;
 
 typedef struct jsonbc_cached_key
 {
 	uint32	 keyhash;
-	uint32	 pairslen;
-	jsonbc_pair	**pairs;	/* for hash collisions */
+	List	*pairs;
 } jsonbc_cached_key;
 
 typedef struct jsonbc_cached_id

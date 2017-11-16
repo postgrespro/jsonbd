@@ -1,4 +1,5 @@
 #include "jsonbc.h"
+#include "jsonbc_utils.h"
 
 #include "postgres.h"
 #include "fmgr.h"
@@ -53,8 +54,8 @@ static void memory_reset_callback(void *arg);
 static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
 static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
 static void setup_guc_variables(void);
-static char *jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen);
-static void jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
+static char *jsonbc_worker_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen);
+static void jsonbc_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
 static uint32 decode_varbyte(unsigned char *ptr);
 
 static size_t
@@ -336,7 +337,7 @@ jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
 
 /* Get key IDs using workers */
 static void
-jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys)
+jsonbc_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys)
 {
 	JsonbcCommand		cmd = JSONBC_CMD_GET_IDS;
 	shm_mq_iovec		iov[4];
@@ -361,7 +362,7 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkey
 
 /* Get keys by their IDs using workers */
 static char *
-jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen)
+jsonbc_worker_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen)
 {
 	JsonbcCommand		cmd = JSONBC_CMD_GET_KEYS;
 	shm_mq_iovec		iov[4];
@@ -606,7 +607,7 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 			Assert(offset == len);
 
 			/* retrieve or generate ids */
-			jsonbc_get_key_ids(ac->cmoptoid, buf, len, idsbuf, nkeys);
+			jsonbc_worker_get_key_ids(ac->cmoptoid, buf, len, idsbuf, nkeys);
 
 			/* replace the old keys with encoded ids */
 			for (i = 0; i < nkeys; i++)
@@ -690,7 +691,7 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 			}
 
 			/* retrieve keys */
-			buf = jsonbc_get_keys(ac->cmoptoid, compression_buffers->idsbuf, nkeys, &buflen);
+			buf = jsonbc_worker_get_keys(ac->cmoptoid, compression_buffers->idsbuf, nkeys, &buflen);
 			if (buf == NULL)
 				elog(ERROR, "jsonbc: decompression error");
 

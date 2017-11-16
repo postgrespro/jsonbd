@@ -1,4 +1,5 @@
 #include "jsonbc.h"
+#include "jsonbc_utils.h"
 
 #include "postgres.h"
 #include "fmgr.h"
@@ -54,6 +55,11 @@ static const char *sql_dictionary = \
 	"  key		TEXT NOT NULL);"
 	"CREATE UNIQUE INDEX jsonbc_dict_on_id ON " JSONBC_DICTIONARY_REL "(cmopt, id);"
 	"CREATE UNIQUE INDEX jsonbc_dict_on_key ON " JSONBC_DICTIONARY_REL " (cmopt, key);";
+
+static const char *sql_insert = \
+	"WITH t AS (SELECT (COALESCE(MAX(id), 0) + 1) new_id FROM "
+	JSONBC_DICTIONARY_REL " WHERE cmopt = %d) INSERT INTO " JSONBC_DICTIONARY_REL
+	" SELECT %d, t.new_id, '%s' FROM t RETURNING id";
 
 enum {
 	JSONBC_DICTIONARY_REL_ATT_CMOPT = 1,
@@ -207,212 +213,250 @@ jsonbc_register_worker(int n)
 	RegisterBackgroundWorker(&worker);
 }
 
+static char *
+jsonbc_get_key(Relation rel, Relation indrel, Oid cmoptoid, uint32 key_id)
+{
+	IndexScanDesc	scan;
+	ScanKeyData		skey[2];
+	Datum			key_datum;
+	HeapTuple		tup;
+	bool			isNull;
+	MemoryContext	old_mcxt;
+	char		   *res;
+
+	ScanKeyInit(&skey[0],
+				JSONBC_DICTIONARY_REL_ATT_CMOPT,
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(cmoptoid));
+	ScanKeyInit(&skey[1],
+				JSONBC_DICTIONARY_REL_ATT_ID,
+				BTEqualStrategyNumber,
+				F_INT4EQ,
+				Int32GetDatum(key_id));
+
+	scan = index_beginscan(rel, indrel, SnapshotAny, 2, 0);
+	index_rescan(scan, skey, 2, NULL, 0);
+
+	tup = index_getnext(scan, ForwardScanDirection);
+	if (tup == NULL)
+		elog(ERROR, "key not found for cmopt=%d and id=%d", cmoptoid, key_id);
+
+	key_datum = heap_getattr(tup, JSONBC_DICTIONARY_REL_ATT_KEY,
+						  RelationGetDescr(rel), &isNull);
+	Assert(!isNull);
+
+	old_mcxt = MemoryContextSwitchTo(worker_context);
+	res = TextDatumGetCString(key_datum);
+	MemoryContextSwitchTo(old_mcxt);
+
+	index_endscan(scan);
+	return res;
+}
+
 /* Returns buffers with keys ordered by ids */
 static char **
-jsonbc_get_keys_slow(Oid cmoptoid, uint32 *ids, int nkeys)
+jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys)
 {
-	MemoryContext	old_mcxt;
 	int				i;
 	char		  **keys;
+	jsonbc_cached_cmopt		*cmcache;
 
 	Oid			relid = jsonbc_get_dictionary_relid();
-	Relation	rel,
-				idxrel;
+	Relation	rel = NULL,
+				indrel;
 
-	start_xact_command();
-
-	rel = relation_open(relid, AccessShareLock);
-	idxrel = index_open(jsonbc_id_indoid, AccessShareLock);
-
+	cmcache = get_cached_compression_options(cmoptoid);
 	keys = (char **) MemoryContextAlloc(worker_context,
 										sizeof(char *) * nkeys);
 
 	for (i = 0; i < nkeys; i++)
 	{
-		IndexScanDesc	scan;
-		ScanKeyData		skey[2];
-		Datum			key_datum;
-		HeapTuple		tup;
-		bool			isNull;
+		bool		found;
+		MemoryContext	oldcontext;
+		jsonbc_cached_id		*cid;
+		jsonbc_pair				*pair;
 
-		ScanKeyInit(&skey[0],
-					JSONBC_DICTIONARY_REL_ATT_CMOPT,
-					BTEqualStrategyNumber,
-					F_OIDEQ,
-					ObjectIdGetDatum(cmoptoid));
-		ScanKeyInit(&skey[1],
-					JSONBC_DICTIONARY_REL_ATT_ID,
-					BTEqualStrategyNumber,
-					F_INT4EQ,
-					Int32GetDatum(ids[i]));
+		Assert(cmcache->id_cache);
+		cid = hash_search(cmcache->id_cache, &ids[i], HASH_ENTER, &found);
 
-		scan = index_beginscan(rel, idxrel, SnapshotAny, 2, 0);
-		index_rescan(scan, skey, 2, NULL, 0);
+		if (found)
+		{
+			keys[i] = cid->pair->key;
+			continue;
+		}
 
-		tup = index_getnext(scan, ForwardScanDirection);
-		if (tup == NULL)
-			elog(ERROR, "key not found for cmopt=%d and id=%d", cmoptoid, ids[i]);
+		if (!rel)
+		{
+			start_xact_command();
+			rel = relation_open(relid, AccessShareLock);
+			indrel = index_open(jsonbc_id_indoid, AccessShareLock);
+		}
+		keys[i] = jsonbc_get_key(rel, indrel, cmoptoid, ids[i]);
 
-		key_datum = heap_getattr(tup, JSONBC_DICTIONARY_REL_ATT_KEY,
-							  RelationGetDescr(rel), &isNull);
-		Assert(isNull == false);
-
-		old_mcxt = MemoryContextSwitchTo(worker_context);
-		keys[i] = TextDatumGetCString(key_datum);
-		MemoryContextSwitchTo(old_mcxt);
-
-		index_endscan(scan);
+		/* create new pair and save it in cache */
+		oldcontext = MemoryContextSwitchTo(worker_cache_context);
+		pair = (jsonbc_pair *) palloc(sizeof(jsonbc_pair));
+		pair->id = ids[i];
+		pair->key = pstrdup(keys[i]);
+		cid->pair = pair;
+		MemoryContextSwitchTo(oldcontext);
 	}
 
-	index_close(idxrel, AccessShareLock);
-	relation_close(rel, AccessShareLock);
+	if (rel)
+	{
+		index_close(indrel, AccessShareLock);
+		relation_close(rel, AccessShareLock);
+		finish_xact_command();
+	}
 
-	finish_xact_command();
 	return keys;
 }
 
-static void
-jsonbc_bulk_insert_keys(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
+/*
+ * Search for key in index.
+ * Index should be locked properly
+ */
+static uint32
+jsonbc_get_key_id(Relation rel, Relation indrel, Oid cmoptoid, char *key)
 {
-	Oid		relid = jsonbc_get_dictionary_relid();
-	Relation rel;
+	IndexScanDesc	scan;
+	ScanKeyData		skey[2];
+	HeapTuple		tup;
+	bool			isNull;
+	uint32			result = 0;
 
-	int			i,
-				counter,
-				hi_options;
-	HeapTuple  *buffered;
-	Datum		values[JSONBC_DICTIONARY_REL_ATT_COUNT];
-	Datum		nulls[JSONBC_DICTIONARY_REL_ATT_COUNT];
-	BulkInsertState	bistate;
-	TupleTableSlot	*myslot;
-	ResultRelInfo *resultRelInfo;
-	ExprContext *econtext;
-	EState	   *estate = CreateExecutorState();
-	MemoryContext oldcontext = CurrentMemoryContext;
+	ScanKeyInit(&skey[0],
+				JSONBC_DICTIONARY_REL_ATT_CMOPT,
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(cmoptoid));
+	ScanKeyInit(&skey[1],
+				JSONBC_DICTIONARY_REL_ATT_KEY,
+				BTEqualStrategyNumber,
+				F_TEXTEQ,
+				CStringGetTextDatum(key));
 
-	start_xact_command();
-	rel = heap_open(relid, RowExclusiveLock);
+	scan = index_beginscan(rel, indrel, SnapshotAny, 2, 0);
+	index_rescan(scan, skey, 2, NULL, 0);
 
-	/* setup states */
-	bistate = GetBulkInsertState();
-	myslot = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(myslot, RelationGetDescr(rel));
-	add_range_table_to_estate(estate, rel);
-
-	/* we need resultRelInfo to insert to indexes */
-	resultRelInfo = makeNode(ResultRelInfo);
-	InitResultRelInfo(resultRelInfo, rel, 1, NULL, 0);
-
-	ExecOpenIndices(resultRelInfo, false);
-	MemSet(values, 0, sizeof(values));
-	MemSet(nulls, 0, sizeof(nulls));
-
-	/* only one process can insert to dictionary at same time */
-	LockDatabaseObject(relid, cmoptoid, 0, ExclusiveLock);
-
-	buffered = palloc(sizeof(HeapTuple) * nkeys);
-	for (i = 0; i < nkeys; i++)
+	tup = index_getnext(scan, ForwardScanDirection);
+	if (tup != NULL)
 	{
-		HeapTuple	tuple;
-
-		values[JSONBC_DICTIONARY_REL_ATT_CMOPT - 1] = ObjectIdGetDatum(cmoptoid);
-		values[JSONBC_DICTIONARY_REL_ATT_ID - 1] = Int32GetDatum(counter++);
-		values[JSONBC_DICTIONARY_REL_ATT_KEY - 1] = CStringGetTextDatum(buf);
-
-		tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-		tuple->t_tableOid = relid;
-
-		buffered[i] = tuple;
-
-		/* move to next key */
-		while (*buf != '\0')
-			buf++;
-
-		buf++;
+		Datum dat = heap_getattr(tup, JSONBC_DICTIONARY_REL_ATT_ID,
+							  RelationGetDescr(rel), &isNull);
+		Assert(!isNull);
+		result = DatumGetInt32(dat);
 	}
+	index_endscan(scan);
 
-	if (!XLogIsNeeded())
-		hi_options |= HEAP_INSERT_SKIP_WAL;
-
-	heap_multi_insert(rel,
-					  buffered,
-					  nkeys,
-					  mycid,
-					  hi_options,
-					  bistate);
-
-	/* update indexes */
-	for (i = 0; i < nkeys; i++)
-	{
-		List	   *recheckIndexes;
-
-		ExecStoreTuple(buffered[i], myslot, InvalidBuffer, false);
-		recheckIndexes =
-			ExecInsertIndexTuples(myslot, &(buffered[i]->t_self),
-								  estate, false, NULL, NIL);
-		list_free(recheckIndexes);
-	}
-
-	UnlockDatabaseObject(relid, cmoptoid, 0, ExclusiveLock);
-
-	FreeBulkInsertState(bistate);
-	heap_close(rel, RowExclusiveLock);
-	finish_xact_command();
+	return result;
 }
 
 /*
  * Get key IDs using relation
- * TODO: change to direct access
  */
 static void
-jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
+jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 {
-	Relation	rel;
+	Relation	rel = NULL;
+	int			i;
+	Oid			relid = jsonbc_get_dictionary_relid();
+	bool		spi_on = false;
+	jsonbc_cached_cmopt		*cmcache;
 
-	int		i;
-	Oid		relid = jsonbc_get_dictionary_relid();
-
-	start_xact_command();
-	rel = relation_open(relid, ShareLock);
-
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	cmcache = get_cached_compression_options(cmoptoid);
 
 	for (i = 0; i < nkeys; i++)
 	{
-		Datum		datum;
-		bool		isnull;
-		char	   *sql;
+		uint32		hkey;
+		bool		found;
+		Relation	indrel;
+		MemoryContext	oldcontext;
+		jsonbc_cached_key		*ckey;
+		jsonbc_pair				*pair;
 
-		sql = psprintf("SELECT id FROM public.jsonbc_dictionary WHERE cmopt = %d"
-					   "	AND key = '%s'", cmoptoid, buf);
+		hkey = qhashmurmur3_32(buf, strlen(buf));
 
-		if (SPI_exec(sql, 0) != SPI_OK_SELECT)
-			elog(ERROR, "SPI_exec failed");
-
-		pfree(sql);
-
-		if (SPI_processed == 0)
+		Assert(cmcache->key_cache);
+		ckey = hash_search(cmcache->key_cache, &hkey, HASH_ENTER, &found);
+		if (found)
 		{
-			char *sql2 = psprintf("with t as (select (coalesce(max(id), 0) + 1) new_id from "
-						"public.jsonbc_dictionary where cmopt = %d) insert into public.jsonbc_dictionary"
-						" select %d, t.new_id, '%s' from t returning id",
-						cmoptoid, cmoptoid, buf);
+			ListCell	*lc;
 
-			if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
-				elog(ERROR, "SPI_exec failed");
+			/* collisions check */
+			foreach(lc, ckey->pairs)
+			{
+				jsonbc_pair	*pair = lfirst(lc);
+				if (strcmp(pair->key, buf) == 0)
+				{
+					idsbuf[i] = pair->id;
+					goto next;
+				}
+			}
+		}
+		else ckey->pairs = NIL;
 
-			pfree(sql2);
+		/* create new pair and save it in cache, id will be set after scan */
+		oldcontext = MemoryContextSwitchTo(worker_cache_context);
+		pair = (jsonbc_pair *) palloc(sizeof(jsonbc_pair));
+		pair->key = pstrdup(buf);
+		ckey->pairs = lappend(ckey->pairs, pair);
+		MemoryContextSwitchTo(oldcontext);
+
+		/* lazy transaction creation */
+		if (!rel)
+		{
+			start_xact_command();
+			rel = relation_open(relid, AccessShareLock);
 		}
 
-		datum = SPI_getbinval(SPI_tuptable->vals[0],
-							  SPI_tuptable->tupdesc,
-							  1,
-							  &isnull);
-		if (isnull)
-			elog(ERROR, "id is NULL");
+		indrel = index_open(jsonbc_keys_indoid, AccessShareLock);
+		idsbuf[i] = jsonbc_get_key_id(rel, indrel, cmoptoid, buf);
 
-		idsbuf[i] = DatumGetInt32(datum);
+		if (idsbuf[i] == 0)
+		{
+			Relation	indrel2;
+
+			indrel2 = index_open(jsonbc_keys_indoid, ExclusiveLock);
+
+			/* recheck, key could be added while we wait for lock */
+			idsbuf[i] = jsonbc_get_key_id(rel, indrel2, cmoptoid, buf);
+
+			if (idsbuf[i] == 0)
+			{
+				/* still need to add */
+				Datum	datum;
+				bool	isnull;
+				char   *sql2 = psprintf(sql_insert, cmoptoid, cmoptoid, buf);
+
+				if (!spi_on)
+				{
+					if (SPI_connect() != SPI_OK_CONNECT)
+						elog(ERROR, "SPI_connect failed");
+
+					spi_on = true;
+				}
+
+				if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
+					elog(ERROR, "SPI_exec failed");
+
+				pfree(sql2);
+
+				datum = SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc,
+									  1,
+									  &isnull);
+				Assert(!isnull);
+				idsbuf[i] = DatumGetInt32(datum);
+			}
+			index_close(indrel2, ExclusiveLock);
+		}
+		index_close(indrel, AccessShareLock);
+
+		pair->id = idsbuf[i];
+next:
+		Assert(idsbuf[i] > 0);
 
 		/* move to next key */
 		while (*buf != '\0')
@@ -420,9 +464,15 @@ jsonbc_get_key_ids_slow(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 
 		buf++;
 	}
-	SPI_finish();
-	relation_close(rel, ShareLock);
-	finish_xact_command();
+
+	if (spi_on)
+		SPI_finish();
+
+	if (rel)
+	{
+		relation_close(rel, AccessShareLock);
+		finish_xact_command();
+	}
 }
 
 static char *
@@ -437,7 +487,7 @@ jsonbc_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
 	PG_TRY();
 	{
 		start_xact_command();
-		jsonbc_get_key_ids_slow(cmoptoid, buf, idsbuf, nkeys);
+		jsonbc_get_key_ids(cmoptoid, buf, idsbuf, nkeys);
 		finish_xact_command();
 	}
 	PG_CATCH();
@@ -465,7 +515,7 @@ jsonbc_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids)
 
 	PG_TRY();
 	{
-		keys = jsonbc_get_keys_slow(cmoptoid, ids, nkeys);
+		keys = jsonbc_get_keys(cmoptoid, ids, nkeys);
 	}
 	PG_CATCH();
 	{
