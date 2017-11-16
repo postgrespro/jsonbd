@@ -46,7 +46,6 @@ static shm_toc *toc = NULL;
 /* global */
 void *workers_data = NULL;
 int jsonbc_nworkers = -1;
-int jsonbc_cache_size = 0;
 int jsonbc_queue_size = 0;
 
 static void init_memory_context(bool);
@@ -178,19 +177,6 @@ setup_guc_variables(void)
 							MAX_JSONBC_WORKERS,
 							PGC_SUSET,
 							0,
-							NULL,
-							NULL,
-							NULL);
-
-	DefineCustomIntVariable("jsonbc.cache_size",
-							"Cache size for each compression options (kilobytes)",
-							NULL,
-							&jsonbc_cache_size,
-							1, /* 1kb by default */
-							0,	/* no cache */
-							1024, /* 1 mb */
-							PGC_SUSET,
-							GUC_UNIT_KB,
 							NULL,
 							NULL,
 							NULL);
