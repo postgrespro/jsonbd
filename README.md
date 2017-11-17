@@ -1,4 +1,4 @@
-# jsonbc
+# jsonbd
 
 JSONB compression method for PostgreSQL.
 
