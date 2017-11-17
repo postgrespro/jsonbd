@@ -35,11 +35,11 @@ class Tests(unittest.TestCase):
     def test_correctness(self):
         with get_new_node('node1') as node:
             node.init()
-            node.append_conf("postgresql.conf", "shared_preload_libraries='jsonbc'\n")
+            node.append_conf("postgresql.conf", "shared_preload_libraries='jsonbd'\n")
             node.start()
 
-            node.psql('postgres', 'create extension jsonbc')
-            node.psql('postgres', 'create compression method cm1 handler jsonbc_compression_handler')
+            node.psql('postgres', 'create extension jsonbd')
+            node.psql('postgres', 'create compression method cm1 handler jsonbd_compression_handler')
             node.psql('postgres', 'create table t1(pk serial, a jsonb compressed cm1);')
 
             data = []

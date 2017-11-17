@@ -1,5 +1,5 @@
-#include "jsonbc.h"
-#include "jsonbc_utils.h"
+#include "jsonbd.h"
+#include "jsonbd_utils.h"
 
 #include "postgres.h"
 #include "fmgr.h"
@@ -34,38 +34,38 @@
 
 static bool						xact_started = false;
 static bool						shutdown_requested = false;
-static jsonbc_shm_worker	   *worker_state;
+static jsonbd_shm_worker	   *worker_state;
 static MemoryContext			worker_context = NULL;
 static MemoryContext			worker_cache_context = NULL;
 static HTAB					   *cmcache;
 
-Oid jsonbc_dictionary_reloid	= InvalidOid;
-Oid	jsonbc_keys_indoid			= InvalidOid;
-Oid	jsonbc_id_indoid			= InvalidOid;
+Oid jsonbd_dictionary_reloid	= InvalidOid;
+Oid	jsonbd_keys_indoid			= InvalidOid;
+Oid	jsonbd_id_indoid			= InvalidOid;
 
-void worker_main(Datum arg);
-static Oid jsonbc_get_dictionary_relid(void);
+void jsonbd_worker_main(Datum arg);
+static Oid jsonbd_get_dictionary_relid(void);
 
-#define JSONBC_DICTIONARY_REL	"jsonbc_dictionary"
+#define JSONBD_DICTIONARY_REL	"jsonbd_dictionary"
 
 static const char *sql_dictionary = \
-	"CREATE TABLE public." JSONBC_DICTIONARY_REL
+	"CREATE TABLE public." JSONBD_DICTIONARY_REL
 	" (cmopt	OID NOT NULL,"
 	"  id		INT4 NOT NULL,"
 	"  key		TEXT NOT NULL);"
-	"CREATE UNIQUE INDEX jsonbc_dict_on_id ON " JSONBC_DICTIONARY_REL "(cmopt, id);"
-	"CREATE UNIQUE INDEX jsonbc_dict_on_key ON " JSONBC_DICTIONARY_REL " (cmopt, key);";
+	"CREATE UNIQUE INDEX jsonbd_dict_on_id ON " JSONBD_DICTIONARY_REL "(cmopt, id);"
+	"CREATE UNIQUE INDEX jsonbd_dict_on_key ON " JSONBD_DICTIONARY_REL " (cmopt, key);";
 
 static const char *sql_insert = \
 	"WITH t AS (SELECT (COALESCE(MAX(id), 0) + 1) new_id FROM "
-	JSONBC_DICTIONARY_REL " WHERE cmopt = %d) INSERT INTO " JSONBC_DICTIONARY_REL
+	JSONBD_DICTIONARY_REL " WHERE cmopt = %d) INSERT INTO " JSONBD_DICTIONARY_REL
 	" SELECT %d, t.new_id, '%s' FROM t RETURNING id";
 
 enum {
-	JSONBC_DICTIONARY_REL_ATT_CMOPT = 1,
-	JSONBC_DICTIONARY_REL_ATT_ID,
-	JSONBC_DICTIONARY_REL_ATT_KEY,
-	JSONBC_DICTIONARY_REL_ATT_COUNT
+	JSONBD_DICTIONARY_REL_ATT_CMOPT = 1,
+	JSONBD_DICTIONARY_REL_ATT_ID,
+	JSONBD_DICTIONARY_REL_ATT_KEY,
+	JSONBD_DICTIONARY_REL_ATT_COUNT
 };
 
 /*
@@ -85,11 +85,11 @@ handle_sigterm(SIGNAL_ARGS)
 }
 
 /* Returns an item from compression options cache */
-static jsonbc_cached_cmopt *
+static jsonbd_cached_cmopt *
 get_cached_compression_options(Oid cmoptoid)
 {
 	bool	found;
-	jsonbc_cached_cmopt *cmdata;
+	jsonbd_cached_cmopt *cmdata;
 
 	cmdata = hash_search(cmcache, &cmoptoid, HASH_ENTER, &found);
 	if (!found)
@@ -98,17 +98,17 @@ get_cached_compression_options(Oid cmoptoid)
 
 		memset(&hash_ctl, 0, sizeof(hash_ctl));
 		hash_ctl.keysize = sizeof(uint32);
-		hash_ctl.entrysize = sizeof(jsonbc_cached_key);
+		hash_ctl.entrysize = sizeof(jsonbd_cached_key);
 		hash_ctl.hcxt = worker_cache_context;
 
 		cmdata->cmoptoid = cmoptoid;
-		cmdata->key_cache = hash_create("jsonbc map by key",
+		cmdata->key_cache = hash_create("jsonbd map by key",
 							  128,
 							  &hash_ctl,
 							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-		hash_ctl.entrysize = sizeof(jsonbc_cached_id);
-		cmdata->id_cache = hash_create("jsonbc map by id",
+		hash_ctl.entrysize = sizeof(jsonbd_cached_id);
+		cmdata->id_cache = hash_create("jsonbd map by id",
 							  128,
 							  &hash_ctl,
 							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
@@ -121,8 +121,8 @@ init_local_variables(int worker_num)
 {
 	HASHCTL		hash_ctl;
 
-	shm_toc		   *toc = shm_toc_attach(JSONBC_SHM_MQ_MAGIC, workers_data);
-	jsonbc_shm_hdr *hdr = shm_toc_lookup(toc, 0, false);
+	shm_toc		   *toc = shm_toc_attach(JSONBD_SHM_MQ_MAGIC, workers_data);
+	jsonbd_shm_hdr *hdr = shm_toc_lookup(toc, 0, false);
 	hdr->workers_ready++;
 
 	worker_state = shm_toc_lookup(toc, worker_num + 1, false);
@@ -140,27 +140,27 @@ init_local_variables(int worker_num)
 	/* this context will be reset after each task */
 	Assert(worker_context == NULL);
 	worker_context = AllocSetContextCreate(TopMemoryContext,
-										   "jsonbc worker context",
+										   "jsonbd worker context",
 										   ALLOCSET_DEFAULT_MINSIZE,
 										   ALLOCSET_DEFAULT_INITSIZE,
 										   ALLOCSET_DEFAULT_MAXSIZE);
 
 	worker_cache_context = AllocSetContextCreate(TopMemoryContext,
-										"jsonbc worker cache context",
+										"jsonbd worker cache context",
 										ALLOCSET_DEFAULT_SIZES);
 
 	/* Initialize hash tables used to track update chains */
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(Oid);
-	hash_ctl.entrysize = sizeof(jsonbc_cached_cmopt);
+	hash_ctl.entrysize = sizeof(jsonbd_cached_cmopt);
 	hash_ctl.hcxt = worker_cache_context;
 
-	cmcache = hash_create("jsonbc compression options cache",
+	cmcache = hash_create("jsonbd compression options cache",
 						  128,		/* arbitrary initial size */
 						  &hash_ctl,
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-	elog(LOG, "jsonbc dictionary worker %d started with pid: %d",
+	elog(LOG, "jsonbd dictionary worker %d started with pid: %d",
 			worker_num + 1, MyProcPid);
 }
 
@@ -196,25 +196,8 @@ finish_xact_command(void)
 	}
 }
 
-void
-jsonbc_register_worker(int n)
-{
-	BackgroundWorker worker;
-
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
-					   BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_ConsistentState;
-	worker.bgw_restart_time = 0;
-	worker.bgw_notify_pid = 0;
-	memcpy(worker.bgw_library_name, "jsonbc", BGW_MAXLEN);
-	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
-	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbc dictionary worker %d", n + 1);
-	worker.bgw_main_arg = (Datum) Int32GetDatum(n);
-	RegisterBackgroundWorker(&worker);
-}
-
 static char *
-jsonbc_get_key(Relation rel, Relation indrel, Oid cmoptoid, uint32 key_id)
+jsonbd_get_key(Relation rel, Relation indrel, Oid cmoptoid, uint32 key_id)
 {
 	IndexScanDesc	scan;
 	ScanKeyData		skey[2];
@@ -242,7 +225,7 @@ jsonbc_get_key(Relation rel, Relation indrel, Oid cmoptoid, uint32 key_id)
 	if (tup == NULL)
 		elog(ERROR, "key not found for cmopt=%d and id=%d", cmoptoid, key_id);
 
-	key_datum = heap_getattr(tup, JSONBC_DICTIONARY_REL_ATT_KEY,
+	key_datum = heap_getattr(tup, JSONBD_DICTIONARY_REL_ATT_KEY,
 						  RelationGetDescr(rel), &isNull);
 	Assert(!isNull);
 
@@ -256,13 +239,13 @@ jsonbc_get_key(Relation rel, Relation indrel, Oid cmoptoid, uint32 key_id)
 
 /* Returns buffers with keys ordered by ids */
 static char **
-jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys)
+jsonbd_get_keys(Oid cmoptoid, uint32 *ids, int nkeys)
 {
 	int				i;
 	char		  **keys;
-	jsonbc_cached_cmopt		*cmcache;
+	jsonbd_cached_cmopt		*cmcache;
 
-	Oid			relid = jsonbc_get_dictionary_relid();
+	Oid			relid = jsonbd_get_dictionary_relid();
 	Relation	rel = NULL,
 				indrel;
 
@@ -274,8 +257,8 @@ jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys)
 	{
 		bool		found;
 		MemoryContext	oldcontext;
-		jsonbc_cached_id		*cid;
-		jsonbc_pair				*pair;
+		jsonbd_cached_id		*cid;
+		jsonbd_pair				*pair;
 
 		Assert(cmcache->id_cache);
 		cid = hash_search(cmcache->id_cache, &ids[i], HASH_ENTER, &found);
@@ -290,13 +273,13 @@ jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys)
 		{
 			start_xact_command();
 			rel = relation_open(relid, AccessShareLock);
-			indrel = index_open(jsonbc_id_indoid, AccessShareLock);
+			indrel = index_open(jsonbd_id_indoid, AccessShareLock);
 		}
-		keys[i] = jsonbc_get_key(rel, indrel, cmoptoid, ids[i]);
+		keys[i] = jsonbd_get_key(rel, indrel, cmoptoid, ids[i]);
 
 		/* create new pair and save it in cache */
 		oldcontext = MemoryContextSwitchTo(worker_cache_context);
-		pair = (jsonbc_pair *) palloc(sizeof(jsonbc_pair));
+		pair = (jsonbd_pair *) palloc(sizeof(jsonbd_pair));
 		pair->id = ids[i];
 		pair->key = pstrdup(keys[i]);
 		cid->pair = pair;
@@ -318,7 +301,7 @@ jsonbc_get_keys(Oid cmoptoid, uint32 *ids, int nkeys)
  * Index should be locked properly
  */
 static uint32
-jsonbc_get_key_id(Relation rel, Relation indrel, Oid cmoptoid, char *key)
+jsonbd_get_key_id(Relation rel, Relation indrel, Oid cmoptoid, char *key)
 {
 	IndexScanDesc	scan;
 	ScanKeyData		skey[2];
@@ -343,7 +326,7 @@ jsonbc_get_key_id(Relation rel, Relation indrel, Oid cmoptoid, char *key)
 	tup = index_getnext(scan, ForwardScanDirection);
 	if (tup != NULL)
 	{
-		Datum dat = heap_getattr(tup, JSONBC_DICTIONARY_REL_ATT_ID,
+		Datum dat = heap_getattr(tup, JSONBD_DICTIONARY_REL_ATT_ID,
 							  RelationGetDescr(rel), &isNull);
 		Assert(!isNull);
 		result = DatumGetInt32(dat);
@@ -357,14 +340,14 @@ jsonbc_get_key_id(Relation rel, Relation indrel, Oid cmoptoid, char *key)
  * Get key IDs using relation
  */
 static void
-jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
+jsonbd_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 {
 	Relation	rel = NULL;
 	Relation	indrel;
 	int			i;
-	Oid			relid = jsonbc_get_dictionary_relid();
+	Oid			relid = jsonbd_get_dictionary_relid();
 	bool		spi_on = false;
-	jsonbc_cached_cmopt		*cmcache;
+	jsonbd_cached_cmopt		*cmcache;
 
 	cmcache = get_cached_compression_options(cmoptoid);
 
@@ -373,8 +356,8 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		uint32		hkey;
 		bool		found;
 		MemoryContext	oldcontext;
-		jsonbc_cached_key		*ckey;
-		jsonbc_pair				*pair;
+		jsonbd_cached_key		*ckey;
+		jsonbd_pair				*pair;
 
 		hkey = qhashmurmur3_32(buf, strlen(buf));
 
@@ -387,7 +370,7 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 			/* collisions check */
 			foreach(lc, ckey->pairs)
 			{
-				jsonbc_pair	*pair = lfirst(lc);
+				jsonbd_pair	*pair = lfirst(lc);
 				if (strcmp(pair->key, buf) == 0)
 				{
 					idsbuf[i] = pair->id;
@@ -399,7 +382,7 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 
 		/* create new pair and save it in cache, id will be set after scan */
 		oldcontext = MemoryContextSwitchTo(worker_cache_context);
-		pair = (jsonbc_pair *) palloc(sizeof(jsonbc_pair));
+		pair = (jsonbd_pair *) palloc(sizeof(jsonbd_pair));
 		pair->key = pstrdup(buf);
 		ckey->pairs = lappend(ckey->pairs, pair);
 		MemoryContextSwitchTo(oldcontext);
@@ -409,19 +392,19 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 		{
 			start_xact_command();
 			rel = relation_open(relid, AccessShareLock);
-			indrel = index_open(jsonbc_keys_indoid, AccessShareLock);
+			indrel = index_open(jsonbd_keys_indoid, AccessShareLock);
 		}
 
-		idsbuf[i] = jsonbc_get_key_id(rel, indrel, cmoptoid, buf);
+		idsbuf[i] = jsonbd_get_key_id(rel, indrel, cmoptoid, buf);
 
 		if (idsbuf[i] == 0)
 		{
 			Relation	indrel2;
 
-			indrel2 = index_open(jsonbc_keys_indoid, ExclusiveLock);
+			indrel2 = index_open(jsonbd_keys_indoid, ExclusiveLock);
 
 			/* recheck, key could be added while we wait for lock */
-			idsbuf[i] = jsonbc_get_key_id(rel, indrel2, cmoptoid, buf);
+			idsbuf[i] = jsonbd_get_key_id(rel, indrel2, cmoptoid, buf);
 
 			if (idsbuf[i] == 0)
 			{
@@ -430,8 +413,10 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 				bool	isnull;
 				char   *sql2 = psprintf(sql_insert, cmoptoid, cmoptoid, buf);
 
+				/* TODO: maybe use bulk inserts instead of SPI */
 				if (!spi_on)
 				{
+					/* lazy SPI initialization */
 					if (SPI_connect() != SPI_OK_CONNECT)
 						elog(ERROR, "SPI_connect failed");
 
@@ -453,6 +438,7 @@ jsonbc_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 			index_close(indrel2, ExclusiveLock);
 		}
 
+		/* set correct id in cache */
 		pair->id = idsbuf[i];
 next:
 		Assert(idsbuf[i] > 0);
@@ -473,7 +459,7 @@ next:
 }
 
 static char *
-jsonbc_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
+jsonbd_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
 {
 	uint32		   *idsbuf;
 	MemoryContext	old_mcxt = CurrentMemoryContext;;
@@ -484,7 +470,7 @@ jsonbc_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
 	PG_TRY();
 	{
 		start_xact_command();
-		jsonbc_get_key_ids(cmoptoid, buf, idsbuf, nkeys);
+		jsonbd_get_key_ids(cmoptoid, buf, idsbuf, nkeys);
 		finish_xact_command();
 	}
 	PG_CATCH();
@@ -492,7 +478,7 @@ jsonbc_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
 		ErrorData  *error;
 		MemoryContextSwitchTo(old_mcxt);
 		error = CopyErrorData();
-		elog(LOG, "jsonbc: error occured: %s", error->message);
+		elog(LOG, "jsonbd: error occured: %s", error->message);
 		FlushErrorState();
 		pfree(error);
 
@@ -505,21 +491,21 @@ jsonbc_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
 }
 
 static char **
-jsonbc_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids)
+jsonbd_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids)
 {
 	char		  **keys = NULL;
 	MemoryContext	mcxt = CurrentMemoryContext;;
 
 	PG_TRY();
 	{
-		keys = jsonbc_get_keys(cmoptoid, ids, nkeys);
+		keys = jsonbd_get_keys(cmoptoid, ids, nkeys);
 	}
 	PG_CATCH();
 	{
 		ErrorData  *error;
 		MemoryContextSwitchTo(mcxt);
 		error = CopyErrorData();
-		elog(LOG, "jsonbc: error occured: %s", error->message);
+		elog(LOG, "jsonbd: error occured: %s", error->message);
 		FlushErrorState();
 		pfree(error);
 	}
@@ -529,7 +515,24 @@ jsonbc_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids)
 }
 
 void
-worker_main(Datum arg)
+jsonbd_worker_launcher(void)
+{
+	/* Establish signal handlers before unblocking signals */
+	pqsignal(SIGTERM, handle_sigterm);
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	/* Create resource owner */
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_worker_launcher");
+
+	while (true)
+	{
+	}
+}
+
+void
+jsonbd_worker_main(Datum arg)
 {
 	shm_mq_handle  *mqh = NULL;
 
@@ -543,7 +546,7 @@ worker_main(Datum arg)
 	BackgroundWorkerInitializeConnection("postgres", NULL);
 
 	/* Create resource owner */
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbc_worker");
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_worker");
 	init_local_variables(DatumGetInt32(arg));
 
 	MemoryContextSwitchTo(worker_context);
@@ -578,14 +581,14 @@ worker_main(Datum arg)
 
 			switch (cmd)
 			{
-				case JSONBC_CMD_GET_IDS:
+				case JSONBD_CMD_GET_IDS:
 					iov = (shm_mq_iovec *) palloc(sizeof(shm_mq_iovec));
 					iovlen = 1;
-					iov->data = jsonbc_cmd_get_ids(nkeys, cmoptoid, ptr, &iov->len);
+					iov->data = jsonbd_cmd_get_ids(nkeys, cmoptoid, ptr, &iov->len);
 					break;
-				case JSONBC_CMD_GET_KEYS:
+				case JSONBD_CMD_GET_KEYS:
 				{
-					char **keys = jsonbc_cmd_get_keys(nkeys, cmoptoid, (uint32 *) ptr);
+					char **keys = jsonbd_cmd_get_keys(nkeys, cmoptoid, (uint32 *) ptr);
 					if (keys != NULL)
 					{
 						int i;
@@ -602,7 +605,7 @@ worker_main(Datum arg)
 					break;
 				}
 				default:
-					elog(NOTICE, "jsonbc: got unknown command");
+					elog(NOTICE, "jsonbd: got unknown command");
 			}
 
 			shm_mq_detach(mqh);
@@ -614,7 +617,7 @@ worker_main(Datum arg)
 				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"\0", 1}), 1, false);
 
 			if (resmq != SHM_MQ_SUCCESS)
-				elog(NOTICE, "jsonbc: backend detached early");
+				elog(NOTICE, "jsonbd: backend detached early");
 
 			shm_mq_detach(mqh);
 			MemoryContextReset(worker_context);
@@ -635,30 +638,63 @@ worker_main(Datum arg)
 		ResetLatch(&MyProc->procLatch);
 	}
 
-	elog(LOG, "jsonbc dictionary worker has ended its work");
+	elog(LOG, "jsonbd dictionary worker has ended its work");
 	proc_exit(0);
 }
 
+void
+jsonbd_register_worker(int n)
+{
+	BackgroundWorker worker;
+
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+					   BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time = 0;
+	worker.bgw_notify_pid = 0;
+	memcpy(worker.bgw_library_name, "jsonbd", BGW_MAXLEN);
+	memcpy(worker.bgw_function_name, CppAsString(jsonbd_worker_main), BGW_MAXLEN);
+	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd dictionary worker %d", n + 1);
+	worker.bgw_main_arg = (Datum) Int32GetDatum(n);
+	RegisterBackgroundWorker(&worker);
+}
+
+void
+jsonbd_register_launcher(void)
+{
+	BackgroundWorker worker;
+
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time = 0;
+	worker.bgw_notify_pid = 0;
+	memcpy(worker.bgw_library_name, "jsonbd", BGW_MAXLEN);
+	memcpy(worker.bgw_function_name, CppAsString(jsonbd_worker_launcher), BGW_MAXLEN);
+	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd launcher %d", n + 1);
+	worker.bgw_main_arg = (Datum) Int32GetDatum(0);
+	RegisterBackgroundWorker(&worker);
+}
+
 static Oid
-jsonbc_get_dictionary_relid(void)
+jsonbd_get_dictionary_relid(void)
 {
 	Oid relid,
 		nspoid;
 
-	if (OidIsValid(jsonbc_dictionary_reloid))
-		return jsonbc_dictionary_reloid;
+	if (OidIsValid(jsonbd_dictionary_reloid))
+		return jsonbd_dictionary_reloid;
 
 	start_xact_command();
 
 	nspoid = get_namespace_oid("public", false);
-	relid = get_relname_relid(JSONBC_DICTIONARY_REL, nspoid);
+	relid = get_relname_relid(JSONBD_DICTIONARY_REL, nspoid);
 	if (relid == InvalidOid)
 	{
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
 
 		if (SPI_execute(sql_dictionary, false, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "could not create \"jsonbc\" dictionary");
+			elog(ERROR, "could not create \"jsonbd\" dictionary");
 
 		SPI_finish();
 		CommandCounterIncrement();
@@ -667,13 +703,13 @@ jsonbc_get_dictionary_relid(void)
 		start_xact_command();
 
 		/* get just created table Oid */
-		relid = get_relname_relid(JSONBC_DICTIONARY_REL, nspoid);
-		jsonbc_id_indoid = InvalidOid;
-		jsonbc_keys_indoid = InvalidOid;
+		relid = get_relname_relid(JSONBD_DICTIONARY_REL, nspoid);
+		jsonbd_id_indoid = InvalidOid;
+		jsonbd_keys_indoid = InvalidOid;
 	}
 
 	/* fill index Oids too */
-	if (jsonbc_id_indoid == InvalidOid)
+	if (jsonbd_id_indoid == InvalidOid)
 	{
 		Relation	 rel;
 		ListCell	*lc;
@@ -691,12 +727,12 @@ jsonbc_get_dictionary_relid(void)
 			Relation	indRel = index_open(indOid, NoLock);
 			int			attnum = indRel->rd_index->indkey.values[1];
 
-			if (attnum == JSONBC_DICTIONARY_REL_ATT_ID)
-				jsonbc_id_indoid = indOid;
+			if (attnum == JSONBD_DICTIONARY_REL_ATT_ID)
+				jsonbd_id_indoid = indOid;
 			else
 			{
-				Assert(attnum == JSONBC_DICTIONARY_REL_ATT_KEY);
-				jsonbc_keys_indoid = indOid;
+				Assert(attnum == JSONBD_DICTIONARY_REL_ATT_KEY);
+				jsonbd_keys_indoid = indOid;
 			}
 
 			index_close(indRel, NoLock);
@@ -707,10 +743,10 @@ jsonbc_get_dictionary_relid(void)
 	finish_xact_command();
 
 	/* check we did fill global variables */
-	Assert(OidIsValid(jsonbc_id_indoid));
-	Assert(OidIsValid(jsonbc_keys_indoid));
+	Assert(OidIsValid(jsonbd_id_indoid));
+	Assert(OidIsValid(jsonbd_keys_indoid));
 	Assert(OidIsValid(relid));
 
-	jsonbc_dictionary_reloid = relid;
+	jsonbd_dictionary_reloid = relid;
 	return relid;
 }

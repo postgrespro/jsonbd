@@ -1,5 +1,5 @@
-#include "jsonbc.h"
-#include "jsonbc_utils.h"
+#include "jsonbd.h"
+#include "jsonbd_utils.h"
 
 #include "postgres.h"
 #include "nodes/execnodes.h"
@@ -20,7 +20,7 @@ struct shm_mq_alt
 	/* in postgres version there are more attributes, but we don't need them */
 };
 #else
-#error "shm_mq struct in jsonbc is copied from PostgreSQL 11, please correct it according to your version"
+#error "shm_mq struct in jsonbd is copied from PostgreSQL 11, please correct it according to your version"
 #endif
 
 RangeTblEntry *

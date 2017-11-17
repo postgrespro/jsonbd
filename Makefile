@@ -1,11 +1,11 @@
-# contrib/jsonbc/Makefile
+# contrib/jsonbd/Makefile
 
-MODULE_big = jsonbc
-OBJS= jsonbc.o jsonbc_worker.o jsonbc_utils.o $(WIN32RES)
+MODULE_big = jsonbd
+OBJS= jsonbd.o jsonbd_worker.o jsonbd_utils.o $(WIN32RES)
 
-EXTENSION = jsonbc
-DATA = jsonbc--0.1.sql
-PGFILEDESC = "jsonbc - jsonb compression method"
+EXTENSION = jsonbd
+DATA = jsonbd--0.1.sql
+PGFILEDESC = "jsonbd - jsonb compression method"
 
 REGRESS = basic
 
@@ -16,7 +16,7 @@ endif
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
-subdir = contrib/jsonbc
+subdir = contrib/jsonbd
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

@@ -1,5 +1,5 @@
-#include "jsonbc.h"
-#include "jsonbc_utils.h"
+#include "jsonbd.h"
+#include "jsonbd_utils.h"
 
 #include "postgres.h"
 #include "fmgr.h"
@@ -24,7 +24,7 @@
 #include "utils/pg_crc.h"
 
 PG_MODULE_MAGIC;
-PG_FUNCTION_INFO_V1(jsonbc_compression_handler);
+PG_FUNCTION_INFO_V1(jsonbd_compression_handler);
 
 /* we use one buffer for whole transaction to avoid extra allocations */
 typedef struct
@@ -45,59 +45,59 @@ static shm_toc *toc = NULL;
 
 /* global */
 void *workers_data = NULL;
-int jsonbc_nworkers = -1;
-int jsonbc_queue_size = 0;
+int jsonbd_nworkers = -1;
+int jsonbd_queue_size = 0;
 
 static void init_memory_context(bool);
 static void memory_reset_callback(void *arg);
 static void encode_varbyte(uint32 val, unsigned char *ptr, int *len);
 static char *packJsonbValue(JsonbValue *val, int header_size, int *len);
 static void setup_guc_variables(void);
-static char *jsonbc_worker_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen);
-static void jsonbc_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
+static char *jsonbd_worker_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen);
+static void jsonbd_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys);
 static uint32 decode_varbyte(unsigned char *ptr);
 
 static size_t
-jsonbc_get_queue_size(void)
+jsonbd_get_queue_size(void)
 {
-	return (Size) (jsonbc_queue_size * 1024);
+	return (Size) (jsonbd_queue_size * 1024);
 }
 
 static size_t
-jsonbc_shmem_size(void)
+jsonbd_shmem_size(void)
 {
 	int					i;
 	shm_toc_estimator	e;
 	Size				size;
 
-	Assert(jsonbc_nworkers != -1);
+	Assert(jsonbd_nworkers != -1);
 	shm_toc_initialize_estimator(&e);
 
-	shm_toc_estimate_chunk(&e, sizeof(jsonbc_shm_hdr));
-	for (i = 0; i < jsonbc_nworkers; i++)
+	shm_toc_estimate_chunk(&e, sizeof(jsonbd_shm_hdr));
+	for (i = 0; i < jsonbd_nworkers; i++)
 	{
-		shm_toc_estimate_chunk(&e, sizeof(jsonbc_shm_worker));
-		shm_toc_estimate_chunk(&e, jsonbc_get_queue_size());
-		shm_toc_estimate_chunk(&e, jsonbc_get_queue_size());
+		shm_toc_estimate_chunk(&e, sizeof(jsonbd_shm_worker));
+		shm_toc_estimate_chunk(&e, jsonbd_get_queue_size());
+		shm_toc_estimate_chunk(&e, jsonbd_get_queue_size());
 	}
-	shm_toc_estimate_keys(&e, jsonbc_nworkers * 3 + 1);
+	shm_toc_estimate_keys(&e, jsonbd_nworkers * 3 + 1);
 	size = shm_toc_estimate(&e);
 	return size;
 }
 
 static void
-jsonbc_shmem_startup_hook(void)
+jsonbd_shmem_startup_hook(void)
 {
 	bool			found;
-	Size			size = jsonbc_shmem_size();
-	jsonbc_shm_hdr *hdr;
+	Size			size = jsonbd_shmem_size();
+	jsonbd_shm_hdr *hdr;
 
 	/* Invoke original hook if needed */
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
 
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
-	workers_data = ShmemInitStruct("jsonbc workers shmem", size, &found);
+	workers_data = ShmemInitStruct("jsonbd workers shmem", size, &found);
 
 	if (!found)
 	{
@@ -105,17 +105,17 @@ jsonbc_shmem_startup_hook(void)
 		int	mqkey;
 
 		toc = shm_toc_create(JSONBC_SHM_MQ_MAGIC, workers_data, size);
-		hdr = shm_toc_allocate(toc, sizeof(jsonbc_shm_hdr));
+		hdr = shm_toc_allocate(toc, sizeof(jsonbd_shm_hdr));
 		hdr->workers_ready = 0;
-		sem_init(&hdr->workers_sem, 1, jsonbc_nworkers);
+		sem_init(&hdr->workers_sem, 1, jsonbd_nworkers);
 		shm_toc_insert(toc, 0, hdr);
-		mqkey = jsonbc_nworkers + 1;
+		mqkey = jsonbd_nworkers + 1;
 
-		for (i = 0; i < jsonbc_nworkers; i++)
+		for (i = 0; i < jsonbd_nworkers; i++)
 		{
-			size_t queue_size = jsonbc_get_queue_size();
+			size_t queue_size = jsonbd_get_queue_size();
 
-			jsonbc_shm_worker	*wd = shm_toc_allocate(toc, sizeof(jsonbc_shm_worker));
+			jsonbd_shm_worker	*wd = shm_toc_allocate(toc, sizeof(jsonbd_shm_worker));
 
 			/* each worker will have two mq, for input and output */
 			wd->mqin = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
@@ -146,32 +146,32 @@ _PG_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 	{
 		ereport(ERROR,
-				(errmsg("jsonbc module must be initialized in postmaster."),
-				 errhint("add 'jsonbc' to shared_preload_libraries parameter in postgresql.conf")));
+				(errmsg("jsonbd module must be initialized in postmaster."),
+				 errhint("add 'jsonbd' to shared_preload_libraries parameter in postgresql.conf")));
 	}
 
 	setup_guc_variables();
 
 	prev_shmem_startup_hook = shmem_startup_hook;
-	shmem_startup_hook = jsonbc_shmem_startup_hook;
+	shmem_startup_hook = jsonbd_shmem_startup_hook;
 
-	if (jsonbc_nworkers)
+	if (jsonbd_nworkers)
 	{
 		int i;
-		RequestAddinShmemSpace(jsonbc_shmem_size());
-		for (i = 0; i < jsonbc_nworkers; i++)
-			jsonbc_register_worker(i);
+		RequestAddinShmemSpace(jsonbd_shmem_size());
+		for (i = 0; i < jsonbd_nworkers; i++)
+			jsonbd_register_worker(i);
 	}
-	else elog(LOG, "jsonbc: workers are disabled");
+	else elog(LOG, "jsonbd: workers are disabled");
 }
 
 static void
 setup_guc_variables(void)
 {
-	DefineCustomIntVariable("jsonbc.workers_count",
-							"Count of workers for jsonbc compresssion",
+	DefineCustomIntVariable("jsonbd.workers_count",
+							"Count of workers for jsonbd compresssion",
 							NULL,
-							&jsonbc_nworkers,
+							&jsonbd_nworkers,
 							1, /* default */
 							0, /* if zero then no workers */
 							MAX_JSONBC_WORKERS,
@@ -181,10 +181,10 @@ setup_guc_variables(void)
 							NULL,
 							NULL);
 
-	DefineCustomIntVariable("jsonbc.queue_size",
+	DefineCustomIntVariable("jsonbd.queue_size",
 							"Size of queue used for communication with workers (kilobytes)",
 							NULL,
-							&jsonbc_queue_size,
+							&jsonbd_queue_size,
 							1, /* 1kb by default */
 							1,	/* 1 kb is minimum too */
 							1024, /* 1 mb */
@@ -253,7 +253,7 @@ keys_callback(char *res, size_t reslen, void *arg)
 }
 
 static void
-jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
+jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 		bool (*callback)(char *, size_t, void *), void *callback_arg)
 {
 	int					i;
@@ -261,30 +261,30 @@ jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
 	bool				callback_succeded = false;
 	shm_mq_result		resmq;
 	shm_mq_handle	   *mqh;
-	jsonbc_shm_hdr	   *hdr;
-	jsonbc_shm_worker  *wd;
+	jsonbd_shm_hdr	   *hdr;
+	jsonbd_shm_worker  *wd;
 
 	char			   *res;
 	Size				reslen;
 
-	if (jsonbc_nworkers <= 0)
+	if (jsonbd_nworkers <= 0)
 		/* TODO: maybe add support of multiple databases for dictionaries */
-		elog(ERROR, "jsonbc workers are not available");
+		elog(ERROR, "jsonbd workers are not available");
 
 	hdr = shm_toc_lookup(toc, 0, false);
 	sem_wait(&hdr->workers_sem);
 
-	for (i = 0; i < jsonbc_nworkers; i++)
+	for (i = 0; i < jsonbd_nworkers; i++)
 	{
 		wd = shm_toc_lookup(toc, i + 1, false);
 		if (pg_atomic_test_set_flag(&wd->busy))
 			break;
 	}
 
-	if (i == jsonbc_nworkers)
+	if (i == jsonbd_nworkers)
 	{
 		sem_post(&hdr->workers_sem);
-		elog(ERROR, "jsonbc: could not make a connection with workers");
+		elog(ERROR, "jsonbd: could not make a connection with workers");
 	}
 
 	/* send data */
@@ -318,16 +318,16 @@ jsonbc_communicate(shm_mq_iovec *iov, int iov_len,
 	sem_post(&hdr->workers_sem);
 
 	if (detached)
-		elog(ERROR, "jsonbc: worker has detached");
+		elog(ERROR, "jsonbd: worker has detached");
 
 	if (!callback_succeded)
-		elog(ERROR, "jsonbc: communication error");
+		elog(ERROR, "jsonbd: communication error");
 
 }
 
 /* Get key IDs using workers */
 static void
-jsonbc_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys)
+jsonbd_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys)
 {
 	JsonbcCommand		cmd = JSONBC_CMD_GET_IDS;
 	shm_mq_iovec		iov[4];
@@ -347,12 +347,12 @@ jsonbc_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, i
 
 	state.idsbuf = idsbuf;
 	state.nkeys = nkeys;
-	jsonbc_communicate(iov, 4, ids_callback, &state);
+	jsonbd_communicate(iov, 4, ids_callback, &state);
 }
 
 /* Get keys by their IDs using workers */
 static char *
-jsonbc_worker_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen)
+jsonbd_worker_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen)
 {
 	JsonbcCommand		cmd = JSONBC_CMD_GET_KEYS;
 	shm_mq_iovec		iov[4];
@@ -372,7 +372,7 @@ jsonbc_worker_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen)
 
 	state.buf = NULL;
 	state.buflen = 0;
-	jsonbc_communicate(iov, 4, keys_callback, &state);
+	jsonbd_communicate(iov, 4, keys_callback, &state);
 
 	*buflen = state.buflen;
 	return state.buf;
@@ -441,7 +441,7 @@ init_memory_context(bool init_buffers)
 		return;
 
 	compression_mcxt = AllocSetContextCreate(TopTransactionContext,
-											 "jsonbc compression context",
+											 "jsonbd compression context",
 											 ALLOCSET_DEFAULT_SIZES);
 	cb = MemoryContextAlloc(TopTransactionContext,
 							sizeof(MemoryContextCallback));
@@ -462,7 +462,7 @@ init_memory_context(bool init_buffers)
 		MemoryContextSwitchTo(old_mcxt);
 
 		compression_buffers->item_mcxt = AllocSetContextCreate(compression_mcxt,
-												 "jsonbc item context",
+												 "jsonbd item context",
 												 ALLOCSET_DEFAULT_SIZES);
 	}
 }
@@ -528,7 +528,7 @@ packJsonbValue(JsonbValue *val, int header_size, int *len)
 
 /* Compress jsonb using dictionary */
 static struct varlena *
-jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
+jsonbd_compress(AttributeCompression *ac, const struct varlena *data)
 {
 	int					size;
 	JsonbIteratorToken	r;
@@ -597,7 +597,7 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 			Assert(offset == len);
 
 			/* retrieve or generate ids */
-			jsonbc_worker_get_key_ids(ac->cmoptoid, buf, len, idsbuf, nkeys);
+			jsonbd_worker_get_key_ids(ac->cmoptoid, buf, len, idsbuf, nkeys);
 
 			/* replace the old keys with encoded ids */
 			for (i = 0; i < nkeys; i++)
@@ -626,14 +626,14 @@ jsonbc_compress(AttributeCompression *ac, const struct varlena *data)
 }
 
 static void
-jsonbc_configure(Form_pg_attribute attr, List *options)
+jsonbd_configure(Form_pg_attribute attr, List *options)
 {
 	if (options != NIL)
-		elog(ERROR, "the compression method for jsonbc doesn't take any options");
+		elog(ERROR, "the compression method for jsonbd doesn't take any options");
 }
 
 static struct varlena *
-jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
+jsonbd_decompress(AttributeCompression *ac, const struct varlena *data)
 {
 	JsonbIteratorToken	r;
 	JsonbValue			v,
@@ -681,9 +681,9 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 			}
 
 			/* retrieve keys */
-			buf = jsonbc_worker_get_keys(ac->cmoptoid, compression_buffers->idsbuf, nkeys, &buflen);
+			buf = jsonbd_worker_get_keys(ac->cmoptoid, compression_buffers->idsbuf, nkeys, &buflen);
 			if (buf == NULL)
-				elog(ERROR, "jsonbc: decompression error");
+				elog(ERROR, "jsonbd: decompression error");
 
 			/* replace the encoded keys with real keys */
 			for (i = 0; i < nkeys; i++)
@@ -710,7 +710,7 @@ jsonbc_decompress(AttributeCompression *ac, const struct varlena *data)
 }
 
 Datum
-jsonbc_compression_handler(PG_FUNCTION_ARGS)
+jsonbd_compression_handler(PG_FUNCTION_ARGS)
 {
 	CompressionMethodRoutine   *cmr = makeNode(CompressionMethodRoutine);
 	CompressionMethodOpArgs	   *opargs =
@@ -718,12 +718,12 @@ jsonbc_compression_handler(PG_FUNCTION_ARGS)
 	Oid							typeid = opargs->typeid;
 
 	if (OidIsValid(typeid) && typeid != JSONBOID)
-		elog(ERROR, "unexpected type %d for jsonbc compression handler", typeid);
+		elog(ERROR, "unexpected type %d for jsonbd compression handler", typeid);
 
-	cmr->configure = jsonbc_configure;
+	cmr->configure = jsonbd_configure;
 	cmr->drop = NULL;
-	cmr->compress = jsonbc_compress;
-	cmr->decompress = jsonbc_decompress;
+	cmr->compress = jsonbd_compress;
+	cmr->decompress = jsonbd_decompress;
 
 	PG_RETURN_POINTER(cmr);
 }

@@ -1,4 +1,4 @@
-# jsonbc
+# jsonbd
 
 JSONB compression method for PostgreSQL.
 
@@ -11,8 +11,8 @@ https://commitfest.postgresql.org/15/1294/
 And something like this:
 
 ```
-CREATE EXTENSION jsonbc;
-CREATE COMPRESSION METHOD cm1 HANDLER jsonbc_compression_handler;
+CREATE EXTENSION jsonbd;
+CREATE COMPRESSION METHOD cm1 HANDLER jsonbd_compression_handler;
 CREATE TABLE t(a JSONB);
 ALTER TABLE t ALTER COLUMN a SET COMPRESSED cm1;
 ```
