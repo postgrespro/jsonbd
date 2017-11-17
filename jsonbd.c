@@ -74,15 +74,45 @@ jsonbd_shmem_size(void)
 	shm_toc_initialize_estimator(&e);
 
 	shm_toc_estimate_chunk(&e, sizeof(jsonbd_shm_hdr));
-	for (i = 0; i < jsonbd_nworkers; i++)
+	shm_toc_estimate_chunk(&e, PGSemaphoreShmemSize(1));
+
+	for (i = 0; i < MAX_JSONBD_WORKERS; i++)
 	{
 		shm_toc_estimate_chunk(&e, sizeof(jsonbd_shm_worker));
 		shm_toc_estimate_chunk(&e, jsonbd_get_queue_size());
 		shm_toc_estimate_chunk(&e, jsonbd_get_queue_size());
 	}
-	shm_toc_estimate_keys(&e, jsonbd_nworkers * 3 + 1);
+
+	/* 3 keys each worker + 3 for header (header itself and two queues) */
+	shm_toc_estimate_keys(&e, MAX_JSONBD_WORKERS * 3 + 3);
 	size = shm_toc_estimate(&e);
 	return size;
+}
+
+static void
+jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
+		size_t queue_size)
+{
+	static int mqkey = MAX_JSONBD_WORKERS + 1;
+
+	/* each worker will have two mq, for input and output */
+	wd->mqin = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
+	wd->mqout = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
+
+	/* init worker context */
+	pg_atomic_init_flag(&wd->busy);
+	wd->proc = NULL;
+
+	shm_mq_clean_receiver(wd->mqin);
+	shm_mq_clean_receiver(wd->mqout);
+	shm_mq_clean_sender(wd->mqin);
+	shm_mq_clean_sender(wd->mqout);
+
+	if (worker_num)
+		shm_toc_insert(toc, i + 1, wd);
+
+	shm_toc_insert(toc, mqkey++, wd->mqin);
+	shm_toc_insert(toc, mqkey++, wd->mqout);
 }
 
 static void
@@ -102,40 +132,29 @@ jsonbd_shmem_startup_hook(void)
 	if (!found)
 	{
 		int i;
-		int	mqkey;
+		jsonbd_shm_worker	*wd;
+		size_t queue_size = jsonbd_get_queue_size();
 
-		toc = shm_toc_create(JSONBC_SHM_MQ_MAGIC, workers_data, size);
+		toc = shm_toc_create(JSONBD_SHM_MQ_MAGIC, workers_data, size);
+
+		/* initialize header */
 		hdr = shm_toc_allocate(toc, sizeof(jsonbd_shm_hdr));
 		hdr->workers_ready = 0;
-		sem_init(&hdr->workers_sem, 1, jsonbd_nworkers);
+		hdr->launcher_sem = PGSemaphoreCreate();
+		jsonbd_init_worker(toc, &hdr->launcher, sizeof(Oid));
+
+		for (i = 0; i < MAX_DATABASES; i++)
+			sem_init(&hdr->workers_sem[i], 1, jsonbd_nworkers);
+
 		shm_toc_insert(toc, 0, hdr);
-		mqkey = jsonbd_nworkers + 1;
 
-		for (i = 0; i < jsonbd_nworkers; i++)
+		for (i = 0; i < MAX_JSONBD_WORKERS; i++)
 		{
-			size_t queue_size = jsonbd_get_queue_size();
-
-			jsonbd_shm_worker	*wd = shm_toc_allocate(toc, sizeof(jsonbd_shm_worker));
-
-			/* each worker will have two mq, for input and output */
-			wd->mqin = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
-			wd->mqout = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
-
-			/* init worker context */
-			pg_atomic_init_flag(&wd->busy);
-			wd->proc = NULL;
-
-			shm_mq_clean_receiver(wd->mqin);
-			shm_mq_clean_receiver(wd->mqout);
-			shm_mq_clean_sender(wd->mqin);
-			shm_mq_clean_sender(wd->mqout);
-
-			shm_toc_insert(toc, i + 1, wd);
-			shm_toc_insert(toc, mqkey++, wd->mqin);
-			shm_toc_insert(toc, mqkey++, wd->mqout);
+			wd = shm_toc_allocate(toc, sizeof(jsonbd_shm_worker));
+			jsonbd_init_worker(toc, wd, i + 1, queue_size);
 		}
 	}
-	else toc = shm_toc_attach(JSONBC_SHM_MQ_MAGIC, workers_data);
+	else toc = shm_toc_attach(JSONBD_SHM_MQ_MAGIC, workers_data);
 
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -159,8 +178,7 @@ _PG_init(void)
 	{
 		int i;
 		RequestAddinShmemSpace(jsonbd_shmem_size());
-		for (i = 0; i < jsonbd_nworkers; i++)
-			jsonbd_register_worker(i);
+		jsonbd_register_worker_launcher();
 	}
 	else elog(LOG, "jsonbd: workers are disabled");
 }
@@ -174,7 +192,7 @@ setup_guc_variables(void)
 							&jsonbd_nworkers,
 							1, /* default */
 							0, /* if zero then no workers */
-							MAX_JSONBC_WORKERS,
+							MAX_JSONBD_WORKERS,
 							PGC_SUSET,
 							0,
 							NULL,
@@ -256,36 +274,89 @@ static void
 jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 		bool (*callback)(char *, size_t, void *), void *callback_arg)
 {
-	int					i;
+	int					i,
+						j;
 	bool				detached = false;
 	bool				callback_succeded = false;
 	shm_mq_result		resmq;
 	shm_mq_handle	   *mqh;
 	jsonbd_shm_hdr	   *hdr;
-	jsonbd_shm_worker  *wd;
+	jsonbd_shm_worker  *wd,
+					   *wd_inner;
 
 	char			   *res;
 	Size				reslen;
+	sem_t			   *cursem = NULL;
 
 	if (jsonbd_nworkers <= 0)
 		/* TODO: maybe add support of multiple databases for dictionaries */
 		elog(ERROR, "jsonbd workers are not available");
 
 	hdr = shm_toc_lookup(toc, 0, false);
-	sem_wait(&hdr->workers_sem);
 
-	for (i = 0; i < jsonbd_nworkers; i++)
+	while (cursem == NULL)
 	{
-		wd = shm_toc_lookup(toc, i + 1, false);
-		if (pg_atomic_test_set_flag(&wd->busy))
-			break;
+		/* find some not busy worker */
+		for (i = 0; i < hdr->workers_ready; i++)
+		{
+			wd = shm_toc_lookup(toc, i + 1, false);
+			if (wd->dboid != MyDatabaseId)
+				continue;
+
+			/*
+			 * we found first worker for our database, next 'jsonbd_nworkers'
+			 * workers should be ours, and one of them should be free after sem_wait
+			 */
+			cursem = wd->dbsem;
+			sem_wait(cursem);
+			for (j = i; j < (i + jsonbd_nworkers); j++)
+			{
+				wd = shm_toc_lookup(toc, j + 1, false);
+				Assert(wd->dboid == MyDatabaseId);
+				if (pg_atomic_test_set_flag(&wd->busy))
+					goto comm;
+			}
+
+			/* should never reach here if all worked correctly */
+			sem_post(cursem);
+			elog(ERROR, "jsonbd: could not make a connection with workers");
+		}
+
+		/*
+		 * there are no workers for our database,
+		 * so we should launch them using our jsonbd workers launcher
+		 */
+		PGSemaphoreLock(hdr->launcher_sem);
+		shm_mq_set_sender(hdr->launcher.mqin, MyProc);
+		shm_mq_set_receiver(hdr->launcher.mqout, MyProc);
+
+		mqh = shm_mq_attach(hdr->launcher.mqin, NULL, NULL);
+		resmq = shm_mq_sendv(mqh,
+				&((shm_mq_iovec) {(char *) &MyDatabaseId, sizeof(MyDatabaseId)}), 1, false);
+		if (resmq != SHM_MQ_SUCCESS)
+			detached = true;
+		shm_mq_detach(mqh);
+
+		if (!detached)
+		{
+			mqh = shm_mq_attach(hdr->launcher.mqout, NULL, NULL);
+			resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
+			if (resmq != SHM_MQ_SUCCESS)
+				detached = true;
+
+			shm_mq_detach(mqh);
+		}
+
+		shm_mq_clean_sender(hdr->launcher.mqin);
+		shm_mq_clean_receiver(hdr->launcher.mqout);
+		PGSemaphoreUnlock(hdr->launcher_sem);
+
+		if (detached)
+			elog(ERROR, "jsonbd: workers launcher was detached");
 	}
 
-	if (i == jsonbd_nworkers)
-	{
-		sem_post(&hdr->workers_sem);
-		elog(ERROR, "jsonbd: could not make a connection with workers");
-	}
+goto comm:
+	detached = false;
 
 	/* send data */
 	shm_mq_set_sender(wd->mqin, MyProc);
@@ -315,7 +386,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 	shm_mq_clean_sender(wd->mqin);
 	shm_mq_clean_receiver(wd->mqout);
 	pg_atomic_clear_flag(&wd->busy);
-	sem_post(&hdr->workers_sem);
+	sem_post(cursem);
 
 	if (detached)
 		elog(ERROR, "jsonbd: worker has detached");
@@ -329,7 +400,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 static void
 jsonbd_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, int nkeys)
 {
-	JsonbcCommand		cmd = JSONBC_CMD_GET_IDS;
+	JsonbcCommand		cmd = JSONBD_CMD_GET_IDS;
 	shm_mq_iovec		iov[4];
 	ids_callback_state	state;
 
@@ -354,7 +425,7 @@ jsonbd_worker_get_key_ids(Oid cmoptoid, char *buf, int buflen, uint32 *idsbuf, i
 static char *
 jsonbd_worker_get_keys(Oid cmoptoid, uint32 *ids, int nkeys, size_t *buflen)
 {
-	JsonbcCommand		cmd = JSONBC_CMD_GET_KEYS;
+	JsonbcCommand		cmd = JSONBD_CMD_GET_KEYS;
 	shm_mq_iovec		iov[4];
 	keys_callback_state	state;
 
@@ -478,7 +549,7 @@ memory_reset_callback(void *arg)
  * The result is palloc'd.
  * It adds a space for header, that should be filled later.
  */
-#ifdef PGPRO_JSONBC
+#ifdef PGPRO_JSONBD
 static char *
 packJsonbValue(JsonbValue *val, int header_size, int *len)
 {

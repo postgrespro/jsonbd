@@ -8,10 +8,13 @@
 #include "port/atomics.h"
 #include "storage/proc.h"
 #include "storage/shm_mq.h"
+#include "storage/pg_sema.h"
 
 #define JSONBD_SHM_MQ_MAGIC		0xAAAA
-#define MAX_JSONBD_WORKERS		10
-#define MAX_DATABASES			10
+
+#define MAX_JSONBD_WORKERS_PER_DATABASE		3
+#define MAX_DATABASES						10 /* FIXME: need more? */
+#define MAX_JSONBD_WORKERS	(MAX_DATABASES * MAX_JSONBD_WORKERS_PER_DATABASE)
 
 typedef enum {
 	JSONBD_CMD_GET_IDS,
@@ -21,8 +24,10 @@ typedef enum {
 /* Shared memory structures */
 typedef struct jsonbd_shm_hdr
 {
-	sem_t			workers_sem[MAX_DATABASES];
-	volatile int	workers_ready;
+	PGSemaphore			launcher_sem;
+	sem_t				workers_sem[MAX_DATABASES];
+	volatile int		workers_ready;
+	jsonbd_shm_worker	launcher;
 } jsonbd_shm_hdr;
 
 typedef struct jsonbd_shm_worker
@@ -64,7 +69,7 @@ typedef struct jsonbd_cached_id
 /* Worker launch variables */
 typedef struct jsonbd_worker_init
 {
-	char	dbname[NAMEDATALEN];
+	Oid		dboid;
 	int		shm_key;
 } jsonc_worker_init;
 

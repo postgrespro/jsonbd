@@ -23,34 +23,6 @@ struct shm_mq_alt
 #error "shm_mq struct in jsonbd is copied from PostgreSQL 11, please correct it according to your version"
 #endif
 
-RangeTblEntry *
-add_range_table_to_estate(EState *estate, Relation rel)
-{
-	RangeTblEntry *rte = makeNode(RangeTblEntry);
-	char	   *refname = RelationGetRelationName(rel);
-
-	rte->rtekind = RTE_RELATION;
-	rte->alias = NULL;
-	rte->relid = RelationGetRelid(rel);
-	rte->relkind = rel->rd_rel->relkind;
-
-	rte->eref = makeAlias(refname, NIL);
-
-	rte->lateral = false;
-	rte->inh = false;
-	rte->inFromCl = false;
-
-	rte->requiredPerms = ACL_SELECT;
-	rte->checkAsUser = InvalidOid;
-	rte->selectedCols = NULL;
-	rte->insertedCols = NULL;
-	rte->updatedCols = NULL;
-
-	estate->es_range_table = lappend(estate->es_range_table, rte);
-
-	return rte;
-}
-
 /**
  * Get 32-bit Murmur3 hash. Ported from qLibc library.
  * Added compability with C99, and postgres code style

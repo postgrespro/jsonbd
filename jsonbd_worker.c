@@ -517,6 +517,10 @@ jsonbd_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids)
 void
 jsonbd_worker_launcher(void)
 {
+	shm_toc			*toc;
+	shm_mq_handle	*mqh = NULL;
+	jsonbd_shm_hdr	*hdr;
+
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
 
@@ -526,9 +530,63 @@ jsonbd_worker_launcher(void)
 	/* Create resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_worker_launcher");
 
+	/* Init launcher state */
+	Assert(workers_data != NULL);
+	toc = shm_toc_attach(JSONBD_SHM_MQ_MAGIC, workers_data);
+	hdr = shm_toc_lookup(toc, 0, false);
+	worker_state = &hdr->launcher;
+
+	shm_mq_set_receiver(worker_state->mqin, MyProc);
+	shm_mq_set_sender(worker_state->mqout, MyProc);
+
 	while (true)
 	{
+		int		rc;
+		Size	nbytes;
+		void   *data;
+
+		shm_mq_result	resmq;
+
+		if (!mqh)
+			mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
+
+		resmq = shm_mq_receive(mqh, &nbytes, &data, true);
+
+		if (resmq == SHM_MQ_SUCCESS)
+		{
+			Oid				dboid;
+
+			Assert(nbytes == sizeof(Oid));
+			dboid = *((Oid *) data);
+
+			shm_mq_detach(mqh);
+			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
+			resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"ok", 3}), 1, false);
+
+			if (resmq != SHM_MQ_SUCCESS)
+				elog(NOTICE, "jsonbd: backend detached early");
+
+			shm_mq_detach(mqh);
+			MemoryContextReset(worker_context);
+
+			/* mark we need new handle */
+			mqh = NULL;
+		}
+
+		if (shutdown_requested)
+			break;
+
+		rc = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
+			0, PG_WAIT_EXTENSION);
+
+		if (rc & WL_POSTMASTER_DEATH)
+			break;
+
+		ResetLatch(&MyProc->procLatch);
 	}
+
+	elog(LOG, "jsonbd launcher has ended its work");
+	proc_exit(0);
 }
 
 void
