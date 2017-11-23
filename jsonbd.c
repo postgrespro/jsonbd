@@ -60,7 +60,7 @@ static uint32 decode_varbyte(unsigned char *ptr);
 static size_t
 jsonbd_get_queue_size(void)
 {
-	return (Size) (jsonbd_queue_size * 1024);
+	return (Size) (shm_mq_minimum_size + jsonbd_queue_size * 1024);
 }
 
 static size_t
@@ -74,7 +74,9 @@ jsonbd_shmem_size(void)
 	shm_toc_initialize_estimator(&e);
 
 	shm_toc_estimate_chunk(&e, sizeof(jsonbd_shm_hdr));
-	shm_toc_estimate_chunk(&e, PGSemaphoreShmemSize(1));
+
+	/* two queues for launcher */
+	shm_toc_estimate_chunk(&e, shm_mq_minimum_size * 2);
 
 	for (i = 0; i < MAX_JSONBD_WORKERS; i++)
 	{
@@ -83,8 +85,8 @@ jsonbd_shmem_size(void)
 		shm_toc_estimate_chunk(&e, jsonbd_get_queue_size());
 	}
 
-	/* 3 keys each worker + 3 for header (header itself, launcher and its two queues) */
-	shm_toc_estimate_keys(&e, MAX_JSONBD_WORKERS * 3 + 4);
+	/* 3 keys each worker + 3 for header (header itself and two queues) */
+	shm_toc_estimate_keys(&e, MAX_JSONBD_WORKERS * 3 + 3);
 	size = shm_toc_estimate(&e);
 	return size;
 }
@@ -95,14 +97,13 @@ jsonbd_shmem_size(void)
  * About keys in toc:
  *	0 - for header
  *	1..MAX_JSONBD_WORKERS - workers
- *	MAX_JSONBD_WORKERS + 1 - launcher
- *	MAX_JSONBD_WORKERS + 2 .. - queues
+ *	MAX_JSONBD_WORKERS + 1 .. - queues
  */
 static void
 jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
 		size_t queue_size)
 {
-	static int mqkey = MAX_JSONBD_WORKERS + 2;
+	static int mqkey = MAX_JSONBD_WORKERS + 1;
 
 	/* each worker will have two mq, for input and output */
 	wd->mqin = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
@@ -146,15 +147,11 @@ jsonbd_shmem_startup_hook(void)
 
 		toc = shm_toc_create(JSONBD_SHM_MQ_MAGIC, workers_data, size);
 
-		/* initialize header */
+		/* Initialize header */
 		hdr = shm_toc_allocate(toc, sizeof(jsonbd_shm_hdr));
 		hdr->workers_ready = 0;
-		hdr->launcher_sem = PGSemaphoreCreate();
-		jsonbd_init_worker(toc, &hdr->launcher, MAX_JSONBD_WORKERS + 1, sizeof(Oid));
-
-		for (i = 0; i < MAX_DATABASES; i++)
-			sem_init(&hdr->workers_sem[i], 1, jsonbd_nworkers);
-
+		sem_init(&hdr->launcher_sem, 1, 1);
+		jsonbd_init_worker(toc, &hdr->launcher, 0, shm_mq_minimum_size);
 		shm_toc_insert(toc, 0, hdr);
 
 		for (i = 0; i < MAX_JSONBD_WORKERS; i++)
@@ -285,6 +282,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 	int					i,
 						j;
 	bool				detached = false;
+	bool				launch_failed = false;
 	bool				callback_succeded = false;
 	shm_mq_result		resmq;
 	shm_mq_handle	   *mqh;
@@ -321,8 +319,8 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 				wd = shm_toc_lookup(toc, j + 1, false);
 
 				if (wd->dboid != MyDatabaseId)
-					/* somehow not all workers started for this database */
-					break;
+					/* somehow not all workers started for this database, try next */
+					continue;
 
 				if (pg_atomic_test_set_flag(&wd->busy))
 					goto comm;
@@ -337,7 +335,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 		 * there are no workers for our database,
 		 * so we should launch them using our jsonbd workers launcher
 		 */
-		PGSemaphoreLock(hdr->launcher_sem);
+		sem_wait(&hdr->launcher_sem);
 		shm_mq_set_sender(hdr->launcher.mqin, MyProc);
 		shm_mq_set_receiver(hdr->launcher.mqout, MyProc);
 
@@ -355,15 +353,21 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 			if (resmq != SHM_MQ_SUCCESS)
 				detached = true;
 
+			if (reslen != 2 || res[0] == 'n')
+				launch_failed = true;
+
 			shm_mq_detach(mqh);
 		}
 
 		shm_mq_clean_sender(hdr->launcher.mqin);
 		shm_mq_clean_receiver(hdr->launcher.mqout);
-		PGSemaphoreUnlock(hdr->launcher_sem);
+		sem_post(&hdr->launcher_sem);
 
 		if (detached)
 			elog(ERROR, "jsonbd: workers launcher was detached");
+
+		if (launch_failed)
+			elog(ERROR, "jsonbd: could not launch dictionary worker, see logs");
 	}
 
 comm:

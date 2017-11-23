@@ -8,7 +8,6 @@
 #include "port/atomics.h"
 #include "storage/proc.h"
 #include "storage/shm_mq.h"
-#include "storage/pg_sema.h"
 
 #define JSONBD_SHM_MQ_MAGIC		0xAAAA
 
@@ -34,7 +33,7 @@ typedef struct jsonbd_shm_worker
 /* Shared memory structures */
 typedef struct jsonbd_shm_hdr
 {
-	PGSemaphore			launcher_sem;
+	sem_t				launcher_sem;
 	sem_t				workers_sem[MAX_DATABASES];
 	volatile int		workers_ready;
 	jsonbd_shm_worker	launcher;

@@ -16,6 +16,7 @@
 #include "catalog/pg_compression_opt.h"
 #include "catalog/pg_extension.h"
 #include "commands/extension.h"
+#include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
@@ -525,6 +526,7 @@ jsonbd_worker_launcher(void)
 
 	shm_mq_handle  *mqh = NULL;
 	int				worker_num	= 1;
+	int				database_num = 0;
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -544,6 +546,8 @@ jsonbd_worker_launcher(void)
 	shm_mq_set_receiver(worker_state->mqin, MyProc);
 	shm_mq_set_sender(worker_state->mqout, MyProc);
 
+	elog(LOG, "jsonbd launcher started with pid: %d", MyProcPid);
+
 	while (true)
 	{
 		int		rc;
@@ -559,28 +563,42 @@ jsonbd_worker_launcher(void)
 
 		if (resmq == SHM_MQ_SUCCESS)
 		{
-			bool	success = true;
+			int		started = 0;
 			int		i;
 			Oid		dboid;
 
-			Assert(nbytes == sizeof(Oid));
-			dboid = *((Oid *) data);
-
-			/* start workers for specified database */
-			for (i=0; i < jsonbd_nworkers; i++)
+			if (database_num >= MAX_DATABASES)
+				elog(NOTICE, "jsonbd: reached maximum count of supported databases");
+			else
 			{
-				bool res;
-				res = jsonbd_register_worker(worker_num++, dboid);
-				if (!res)
-					success = false;
+				Assert(nbytes == sizeof(Oid));
+				dboid = *((Oid *) data);
+
+				/* start workers for specified database */
+				for (i=0; i < jsonbd_nworkers; i++)
+				{
+					bool res;
+					res = jsonbd_register_worker(worker_num++, dboid);
+					if (res)
+						started++;
+				}
 			}
 
 			shm_mq_detach(mqh);
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
-			if (success)
-				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"ok", 3}), 1, false);
+			if (started)
+			{
+				if (started != jsonbd_nworkers)
+					elog(NOTICE, "jsonbd: not all workers for %d has started", dboid);
+
+				/* semaphore value should be equal to workers count for database */
+				sem_init(&hdr->workers_sem[database_num], 1, started);
+
+				/* we report ok if only one worker has started */
+				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"y", 2}), 1, false);
+			}
 			else
-				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"fail", 5}), 1, false);
+				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"n", 2}), 1, false);
 
 			if (resmq != SHM_MQ_SUCCESS)
 				elog(NOTICE, "jsonbd: backend detached early");
@@ -754,6 +772,12 @@ jsonbd_register_worker(int worker_num, Oid dboid)
 	BackgroundWorkerHandle *bgw_handle;
 	jsonbd_worker_args *worker_args;
 
+	if (worker_num > MAX_JSONBD_WORKERS)
+	{
+		elog(LOG, "Reached maximum count of jsonbd dictionary workers");
+		return false;
+	}
+
 	/* Initialize DSM segment */
 	seg = dsm_create(sizeof(jsonbd_worker_args), 0);
 	worker_args = (jsonbd_worker_args *) dsm_segment_address(seg);
@@ -767,7 +791,13 @@ jsonbd_register_worker(int worker_num, Oid dboid)
 	worker.bgw_notify_pid = MyProcPid;
 	memcpy(worker.bgw_library_name, "jsonbd", BGW_MAXLEN);
 	memcpy(worker.bgw_function_name, CppAsString(jsonbd_worker_main), BGW_MAXLEN);
-	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd dictionary worker %d", worker_num);
+
+	/* we need transaction to access syscache */
+	start_xact_command();
+	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd, worker %d, db: \"%s\"",
+			worker_num, get_database_name(dboid));
+	finish_xact_command();
+
 	worker.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
 
 	/* Start dynamic worker */
