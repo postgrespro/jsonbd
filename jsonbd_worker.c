@@ -8,29 +8,30 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
-#include "access/xact.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
-#include "catalog/pg_extension.h"
-#include "catalog/pg_compression_opt.h"
+#include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_compression_opt.h"
+#include "catalog/pg_extension.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/shm_mq.h"
 #include "storage/shm_toc.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
-#include "utils/fmgroids.h"
-#include "utils/rel.h"
-#include "utils/lsyscache.h"
 
 static bool						xact_started = false;
 static bool						shutdown_requested = false;
@@ -44,7 +45,9 @@ Oid	jsonbd_keys_indoid			= InvalidOid;
 Oid	jsonbd_id_indoid			= InvalidOid;
 
 void jsonbd_worker_main(Datum arg);
+void jsonbd_worker_launcher(void);
 static Oid jsonbd_get_dictionary_relid(void);
+static bool jsonbd_register_worker(int worker_num, Oid dboid);
 
 #define JSONBD_DICTIONARY_REL	"jsonbd_dictionary"
 
@@ -117,7 +120,7 @@ get_cached_compression_options(Oid cmoptoid)
 }
 
 static void
-init_local_variables(int worker_num)
+init_local_variables(int worker_num, Oid dboid)
 {
 	HASHCTL		hash_ctl;
 
@@ -125,7 +128,7 @@ init_local_variables(int worker_num)
 	jsonbd_shm_hdr *hdr = shm_toc_lookup(toc, 0, false);
 	hdr->workers_ready++;
 
-	worker_state = shm_toc_lookup(toc, worker_num + 1, false);
+	worker_state = shm_toc_lookup(toc, worker_num, false);
 	worker_state->proc = MyProc;
 
 	/* input mq */
@@ -161,7 +164,7 @@ init_local_variables(int worker_num)
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	elog(LOG, "jsonbd dictionary worker %d started with pid: %d",
-			worker_num + 1, MyProcPid);
+			worker_num, MyProcPid);
 }
 
 static void
@@ -518,8 +521,10 @@ void
 jsonbd_worker_launcher(void)
 {
 	shm_toc			*toc;
-	shm_mq_handle	*mqh = NULL;
 	jsonbd_shm_hdr	*hdr;
+
+	shm_mq_handle  *mqh = NULL;
+	int				worker_num	= 1;
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -554,14 +559,28 @@ jsonbd_worker_launcher(void)
 
 		if (resmq == SHM_MQ_SUCCESS)
 		{
-			Oid				dboid;
+			bool	success = true;
+			int		i;
+			Oid		dboid;
 
 			Assert(nbytes == sizeof(Oid));
 			dboid = *((Oid *) data);
 
+			/* start workers for specified database */
+			for (i=0; i < jsonbd_nworkers; i++)
+			{
+				bool res;
+				res = jsonbd_register_worker(worker_num++, dboid);
+				if (!res)
+					success = false;
+			}
+
 			shm_mq_detach(mqh);
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
-			resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"ok", 3}), 1, false);
+			if (success)
+				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"ok", 3}), 1, false);
+			else
+				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"fail", 5}), 1, false);
 
 			if (resmq != SHM_MQ_SUCCESS)
 				elog(NOTICE, "jsonbd: backend detached early");
@@ -592,7 +611,13 @@ jsonbd_worker_launcher(void)
 void
 jsonbd_worker_main(Datum arg)
 {
-	shm_mq_handle  *mqh = NULL;
+	Oid		dboid;
+	int		worker_num;
+
+	dsm_segment			*seg;
+	jsonbd_worker_args	*worker_args;
+	PGPROC				*starter;
+	shm_mq_handle		*mqh = NULL;
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -600,12 +625,31 @@ jsonbd_worker_main(Datum arg)
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
+	/* Initialize connection */
+	seg = dsm_attach((dsm_handle) DatumGetInt32(arg));
+	worker_args = (jsonbd_worker_args *) dsm_segment_address(seg);
+	worker_num = worker_args->worker_num;
+	dboid = worker_args->dboid;
+
+	/* We don't need this segment anymore */
+	dsm_detach(seg);
+
+	starter = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
+	if (starter == NULL)
+	{
+		elog(LOG, "launcher has exited prematurely");
+		goto end;
+	}
+
+	/* Set launcher free */
+	SetLatch(&starter->procLatch);
+
 	/* Connect to our database */
-	BackgroundWorkerInitializeConnection("postgres", NULL);
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid);
 
 	/* Create resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_worker");
-	init_local_variables(DatumGetInt32(arg));
+	init_local_variables(worker_num, dboid);
 
 	MemoryContextSwitchTo(worker_context);
 
@@ -696,25 +740,68 @@ jsonbd_worker_main(Datum arg)
 		ResetLatch(&MyProc->procLatch);
 	}
 
+end:
 	elog(LOG, "jsonbd dictionary worker has ended its work");
 	proc_exit(0);
 }
 
-void
-jsonbd_register_worker(int n)
+static bool
+jsonbd_register_worker(int worker_num, Oid dboid)
 {
-	BackgroundWorker worker;
+	pid_t				pid;
+	dsm_segment		   *seg;
+	BackgroundWorker	worker;
+	BackgroundWorkerHandle *bgw_handle;
+	jsonbd_worker_args *worker_args;
+
+	/* Initialize DSM segment */
+	seg = dsm_create(sizeof(jsonbd_worker_args), 0);
+	worker_args = (jsonbd_worker_args *) dsm_segment_address(seg);
+	worker_args->worker_num = worker_num;
+	worker_args->dboid = dboid;
 
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 					   BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = 0;
-	worker.bgw_notify_pid = 0;
+	worker.bgw_notify_pid = MyProcPid;
 	memcpy(worker.bgw_library_name, "jsonbd", BGW_MAXLEN);
 	memcpy(worker.bgw_function_name, CppAsString(jsonbd_worker_main), BGW_MAXLEN);
-	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd dictionary worker %d", n + 1);
-	worker.bgw_main_arg = (Datum) Int32GetDatum(n);
-	RegisterBackgroundWorker(&worker);
+	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd dictionary worker %d", worker_num);
+	worker.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
+
+	/* Start dynamic worker */
+	if (!RegisterDynamicBackgroundWorker(&worker, &bgw_handle))
+	{
+		elog(LOG, "jsonbd: cannot start dictionary worker");
+		return false;
+	}
+
+	/* Wait till the worker starts */
+	if (WaitForBackgroundWorkerStartup(bgw_handle, &pid) == BGWH_POSTMASTER_DIED)
+	{
+		elog(LOG, "jsonbd: postmaster died during bgworker startup");
+		return false;
+	}
+
+	/* Wait to be signalled. */
+#if PG_VERSION_NUM >= 100000
+	WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
+#else
+	WaitLatch(MyLatch, WL_LATCH_SET, 0);
+#endif
+
+	/* Reset the latch so we don't spin. */
+	ResetLatch(MyLatch);
+
+	/* Remove the segment */
+	dsm_detach(seg);
+
+	/* An interrupt may have occurred while we were waiting. */
+	CHECK_FOR_INTERRUPTS();
+
+	/* all good */
+	return true;
 }
 
 void
@@ -728,7 +815,7 @@ jsonbd_register_launcher(void)
 	worker.bgw_notify_pid = 0;
 	memcpy(worker.bgw_library_name, "jsonbd", BGW_MAXLEN);
 	memcpy(worker.bgw_function_name, CppAsString(jsonbd_worker_launcher), BGW_MAXLEN);
-	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd launcher %d", n + 1);
+	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd launcher");
 	worker.bgw_main_arg = (Datum) Int32GetDatum(0);
 	RegisterBackgroundWorker(&worker);
 }

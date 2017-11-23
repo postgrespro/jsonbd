@@ -9,18 +9,11 @@ PGFILEDESC = "jsonbd - jsonb compression method"
 
 REGRESS = basic
 
-ifdef USE_PGXS
 ifndef PG_CONFIG
 PG_CONFIG = pg_config
 endif
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
-else
-subdir = contrib/jsonbd
-top_builddir = ../..
-include $(top_builddir)/src/Makefile.global
-include $(top_srcdir)/contrib/contrib-global.mk
-endif
 
 python_tests:
 	${MAKE} -C tests python_tests

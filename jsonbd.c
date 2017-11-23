@@ -70,7 +70,7 @@ jsonbd_shmem_size(void)
 	shm_toc_estimator	e;
 	Size				size;
 
-	Assert(jsonbd_nworkers != -1);
+	Assert(jsonbd_nworkers > 0);
 	shm_toc_initialize_estimator(&e);
 
 	shm_toc_estimate_chunk(&e, sizeof(jsonbd_shm_hdr));
@@ -83,17 +83,26 @@ jsonbd_shmem_size(void)
 		shm_toc_estimate_chunk(&e, jsonbd_get_queue_size());
 	}
 
-	/* 3 keys each worker + 3 for header (header itself and two queues) */
-	shm_toc_estimate_keys(&e, MAX_JSONBD_WORKERS * 3 + 3);
+	/* 3 keys each worker + 3 for header (header itself, launcher and its two queues) */
+	shm_toc_estimate_keys(&e, MAX_JSONBD_WORKERS * 3 + 4);
 	size = shm_toc_estimate(&e);
 	return size;
 }
 
+/*
+ * Initialize worker shm block
+ *
+ * About keys in toc:
+ *	0 - for header
+ *	1..MAX_JSONBD_WORKERS - workers
+ *	MAX_JSONBD_WORKERS + 1 - launcher
+ *	MAX_JSONBD_WORKERS + 2 .. - queues
+ */
 static void
 jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
 		size_t queue_size)
 {
-	static int mqkey = MAX_JSONBD_WORKERS + 1;
+	static int mqkey = MAX_JSONBD_WORKERS + 2;
 
 	/* each worker will have two mq, for input and output */
 	wd->mqin = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
@@ -109,7 +118,7 @@ jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
 	shm_mq_clean_sender(wd->mqout);
 
 	if (worker_num)
-		shm_toc_insert(toc, i + 1, wd);
+		shm_toc_insert(toc, worker_num, wd);
 
 	shm_toc_insert(toc, mqkey++, wd->mqin);
 	shm_toc_insert(toc, mqkey++, wd->mqout);
@@ -141,7 +150,7 @@ jsonbd_shmem_startup_hook(void)
 		hdr = shm_toc_allocate(toc, sizeof(jsonbd_shm_hdr));
 		hdr->workers_ready = 0;
 		hdr->launcher_sem = PGSemaphoreCreate();
-		jsonbd_init_worker(toc, &hdr->launcher, sizeof(Oid));
+		jsonbd_init_worker(toc, &hdr->launcher, MAX_JSONBD_WORKERS + 1, sizeof(Oid));
 
 		for (i = 0; i < MAX_DATABASES; i++)
 			sem_init(&hdr->workers_sem[i], 1, jsonbd_nworkers);
@@ -176,9 +185,8 @@ _PG_init(void)
 
 	if (jsonbd_nworkers)
 	{
-		int i;
 		RequestAddinShmemSpace(jsonbd_shmem_size());
-		jsonbd_register_worker_launcher();
+		jsonbd_register_launcher();
 	}
 	else elog(LOG, "jsonbd: workers are disabled");
 }
@@ -281,8 +289,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 	shm_mq_result		resmq;
 	shm_mq_handle	   *mqh;
 	jsonbd_shm_hdr	   *hdr;
-	jsonbd_shm_worker  *wd,
-					   *wd_inner;
+	jsonbd_shm_worker  *wd;
 
 	char			   *res;
 	Size				reslen;
@@ -312,7 +319,11 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 			for (j = i; j < (i + jsonbd_nworkers); j++)
 			{
 				wd = shm_toc_lookup(toc, j + 1, false);
-				Assert(wd->dboid == MyDatabaseId);
+
+				if (wd->dboid != MyDatabaseId)
+					/* somehow not all workers started for this database */
+					break;
+
 				if (pg_atomic_test_set_flag(&wd->busy))
 					goto comm;
 			}
@@ -355,7 +366,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 			elog(ERROR, "jsonbd: workers launcher was detached");
 	}
 
-goto comm:
+comm:
 	detached = false;
 
 	/* send data */
@@ -599,7 +610,7 @@ packJsonbValue(JsonbValue *val, int header_size, int *len)
 
 /* Compress jsonb using dictionary */
 static struct varlena *
-jsonbd_compress(AttributeCompression *ac, const struct varlena *data)
+jsonbd_compress(CompressionMethodOptions *cmoptions, const struct varlena *data)
 {
 	int					size;
 	JsonbIteratorToken	r;
@@ -668,7 +679,7 @@ jsonbd_compress(AttributeCompression *ac, const struct varlena *data)
 			Assert(offset == len);
 
 			/* retrieve or generate ids */
-			jsonbd_worker_get_key_ids(ac->cmoptoid, buf, len, idsbuf, nkeys);
+			jsonbd_worker_get_key_ids(cmoptions->cmoptoid, buf, len, idsbuf, nkeys);
 
 			/* replace the old keys with encoded ids */
 			for (i = 0; i < nkeys; i++)
@@ -704,7 +715,7 @@ jsonbd_configure(Form_pg_attribute attr, List *options)
 }
 
 static struct varlena *
-jsonbd_decompress(AttributeCompression *ac, const struct varlena *data)
+jsonbd_decompress(CompressionMethodOptions *cmoptions, const struct varlena *data)
 {
 	JsonbIteratorToken	r;
 	JsonbValue			v,
@@ -752,7 +763,7 @@ jsonbd_decompress(AttributeCompression *ac, const struct varlena *data)
 			}
 
 			/* retrieve keys */
-			buf = jsonbd_worker_get_keys(ac->cmoptoid, compression_buffers->idsbuf, nkeys, &buflen);
+			buf = jsonbd_worker_get_keys(cmoptions->cmoptoid, compression_buffers->idsbuf, nkeys, &buflen);
 			if (buf == NULL)
 				elog(ERROR, "jsonbd: decompression error");
 

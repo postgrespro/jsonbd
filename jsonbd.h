@@ -21,15 +21,6 @@ typedef enum {
 	JSONBD_CMD_GET_KEYS
 } JsonbcCommand;
 
-/* Shared memory structures */
-typedef struct jsonbd_shm_hdr
-{
-	PGSemaphore			launcher_sem;
-	sem_t				workers_sem[MAX_DATABASES];
-	volatile int		workers_ready;
-	jsonbd_shm_worker	launcher;
-} jsonbd_shm_hdr;
-
 typedef struct jsonbd_shm_worker
 {
 	Oid					dboid;	/* database of the worker */
@@ -39,6 +30,15 @@ typedef struct jsonbd_shm_worker
 	pg_atomic_flag		busy;
 	PGPROC			   *proc;
 } jsonbd_shm_worker;
+
+/* Shared memory structures */
+typedef struct jsonbd_shm_hdr
+{
+	PGSemaphore			launcher_sem;
+	sem_t				workers_sem[MAX_DATABASES];
+	volatile int		workers_ready;
+	jsonbd_shm_worker	launcher;
+} jsonbd_shm_hdr;
 
 /* CACHE */
 typedef struct jsonbd_pair
@@ -66,15 +66,15 @@ typedef struct jsonbd_cached_id
 	jsonbd_pair	*pair;
 } jsonbd_cached_id;
 
-/* Worker launch variables */
-typedef struct jsonbd_worker_init
+/* Worker launch arguments */
+typedef struct jsonbd_worker_args
 {
+	int		worker_num;
 	Oid		dboid;
-	int		shm_key;
-} jsonc_worker_init;
+} jsonbd_worker_args;
 
 extern void _PG_init(void);
-extern void jsonbd_register_worker(int n);
+extern void jsonbd_register_launcher(void);
 
 extern void *workers_data;
 extern int jsonbd_nworkers;
