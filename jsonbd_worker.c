@@ -46,9 +46,9 @@ Oid	jsonbd_keys_indoid			= InvalidOid;
 Oid	jsonbd_id_indoid			= InvalidOid;
 
 void jsonbd_worker_main(Datum arg);
-void jsonbd_worker_launcher(void);
+void jsonbd_launcher_main(Datum arg);
 static Oid jsonbd_get_dictionary_relid(void);
-static bool jsonbd_register_worker(int worker_num, Oid dboid);
+static bool jsonbd_register_worker(int, Oid, volatile Latch *);
 
 #define JSONBD_DICTIONARY_REL	"jsonbd_dictionary"
 
@@ -121,16 +121,25 @@ get_cached_compression_options(Oid cmoptoid)
 }
 
 static void
-init_local_variables(int worker_num, Oid dboid)
+init_worker(dsm_segment *seg)
 {
 	HASHCTL		hash_ctl;
+	jsonbd_worker_args	*worker_args;
 
 	shm_toc		   *toc = shm_toc_attach(JSONBD_SHM_MQ_MAGIC, workers_data);
 	jsonbd_shm_hdr *hdr = shm_toc_lookup(toc, 0, false);
+
+	worker_args = (jsonbd_worker_args *) dsm_segment_address(seg);
+
+	/* increase global count of started workers */
 	hdr->workers_ready++;
 
-	worker_state = shm_toc_lookup(toc, worker_num, false);
+	/* Connect to our database */
+	BackgroundWorkerInitializeConnectionByOid(worker_args->dboid, InvalidOid);
+
+	worker_state = shm_toc_lookup(toc, worker_args->worker_num, false);
 	worker_state->proc = MyProc;
+	worker_state->dboid = worker_args->dboid;
 
 	/* input mq */
 	shm_mq_set_receiver(worker_state->mqin, MyProc);
@@ -165,7 +174,13 @@ init_local_variables(int worker_num, Oid dboid)
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	elog(LOG, "jsonbd dictionary worker %d started with pid: %d",
-			worker_num, MyProcPid);
+			worker_args->worker_num, MyProcPid);
+
+	/* We don't need this segment anymore */
+	dsm_detach(seg);
+
+	/* Set launcher free */
+	SetLatch(&hdr->launcher_latch);
 }
 
 static void
@@ -519,7 +534,7 @@ jsonbd_cmd_get_keys(int nkeys, Oid cmoptoid, uint32 *ids)
 }
 
 void
-jsonbd_worker_launcher(void)
+jsonbd_launcher_main(Datum arg)
 {
 	shm_toc			*toc;
 	jsonbd_shm_hdr	*hdr;
@@ -534,8 +549,11 @@ jsonbd_worker_launcher(void)
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
+	/* Init this launcher as backend so workers can notify it */
+	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, NULL);
+
 	/* Create resource owner */
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_worker_launcher");
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_launcher_main");
 
 	/* Init launcher state */
 	Assert(workers_data != NULL);
@@ -543,6 +561,7 @@ jsonbd_worker_launcher(void)
 	hdr = shm_toc_lookup(toc, 0, false);
 	worker_state = &hdr->launcher;
 
+	InitLatch(&hdr->launcher_latch);
 	shm_mq_set_receiver(worker_state->mqin, MyProc);
 	shm_mq_set_sender(worker_state->mqout, MyProc);
 
@@ -575,12 +594,18 @@ jsonbd_worker_launcher(void)
 				dboid = *((Oid *) data);
 
 				/* start workers for specified database */
-				for (i=0; i < jsonbd_nworkers; i++)
+				for (i=0; i < jsonbd_nworkers; i++, worker_num++)
 				{
 					bool res;
-					res = jsonbd_register_worker(worker_num++, dboid);
+					jsonbd_shm_worker	*wd;
+
+					res = jsonbd_register_worker(worker_num, dboid, &hdr->launcher_latch);
 					if (res)
 						started++;
+
+					/* point worker semaphore to database semaphore */
+					wd = shm_toc_lookup(toc, worker_num, false);
+					wd->dbsem = &hdr->workers_sem[database_num];
 				}
 			}
 
@@ -596,6 +621,8 @@ jsonbd_worker_launcher(void)
 
 				/* we report ok if only one worker has started */
 				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"y", 2}), 1, false);
+
+				database_num += 1;
 			}
 			else
 				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"n", 2}), 1, false);
@@ -604,7 +631,6 @@ jsonbd_worker_launcher(void)
 				elog(NOTICE, "jsonbd: backend detached early");
 
 			shm_mq_detach(mqh);
-			MemoryContextReset(worker_context);
 
 			/* mark we need new handle */
 			mqh = NULL;
@@ -629,12 +655,7 @@ jsonbd_worker_launcher(void)
 void
 jsonbd_worker_main(Datum arg)
 {
-	Oid		dboid;
-	int		worker_num;
-
 	dsm_segment			*seg;
-	jsonbd_worker_args	*worker_args;
-	PGPROC				*starter;
 	shm_mq_handle		*mqh = NULL;
 
 	/* Establish signal handlers before unblocking signals */
@@ -643,31 +664,12 @@ jsonbd_worker_main(Datum arg)
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
-	/* Initialize connection */
-	seg = dsm_attach((dsm_handle) DatumGetInt32(arg));
-	worker_args = (jsonbd_worker_args *) dsm_segment_address(seg);
-	worker_num = worker_args->worker_num;
-	dboid = worker_args->dboid;
-
-	/* Connect to our database */
-	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid);
-
 	/* Create resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_worker");
-	init_local_variables(worker_num, dboid);
 
-	/* We don't need this segment anymore */
-	dsm_detach(seg);
-
-	starter = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
-	if (starter == NULL)
-	{
-		elog(LOG, "launcher has exited prematurely");
-		goto end;
-	}
-
-	/* Set launcher free */
-	SetLatch(&starter->procLatch);
+	/* Initialize connection and local variables */
+	seg = dsm_attach((dsm_handle) DatumGetInt32(arg));
+	init_worker(seg);
 
 	MemoryContextSwitchTo(worker_context);
 
@@ -758,13 +760,12 @@ jsonbd_worker_main(Datum arg)
 		ResetLatch(&MyProc->procLatch);
 	}
 
-end:
 	elog(LOG, "jsonbd dictionary worker has ended its work");
 	proc_exit(0);
 }
 
 static bool
-jsonbd_register_worker(int worker_num, Oid dboid)
+jsonbd_register_worker(int worker_num, Oid dboid, volatile Latch *launcher_latch)
 {
 	pid_t				pid;
 	dsm_segment		   *seg;
@@ -811,13 +812,12 @@ jsonbd_register_worker(int worker_num, Oid dboid)
 
 	/* Wait to be signalled. */
 #if PG_VERSION_NUM >= 100000
-	WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
+	WaitLatch(launcher_latch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
 #else
-	WaitLatch(MyLatch, WL_LATCH_SET, 0);
+	WaitLatch(launcher_latch, WL_LATCH_SET, 0);
 #endif
 
-	/* Reset the latch so we don't spin. */
-	ResetLatch(MyLatch);
+	ResetLatch(launcher_latch);
 
 	/* Remove the segment */
 	dsm_detach(seg);
@@ -839,7 +839,7 @@ jsonbd_register_launcher(void)
 	worker.bgw_restart_time = 0;
 	worker.bgw_notify_pid = 0;
 	memcpy(worker.bgw_library_name, "jsonbd", BGW_MAXLEN);
-	memcpy(worker.bgw_function_name, CppAsString(jsonbd_worker_launcher), BGW_MAXLEN);
+	memcpy(worker.bgw_function_name, CppAsString(jsonbd_launcher_main), BGW_MAXLEN);
 	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd launcher");
 	worker.bgw_main_arg = (Datum) Int32GetDatum(0);
 	RegisterBackgroundWorker(&worker);

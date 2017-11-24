@@ -37,6 +37,7 @@ typedef struct jsonbd_shm_hdr
 	sem_t				workers_sem[MAX_DATABASES];
 	volatile int		workers_ready;
 	jsonbd_shm_worker	launcher;
+	Latch				launcher_latch;
 } jsonbd_shm_hdr;
 
 /* CACHE */
