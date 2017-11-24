@@ -12,9 +12,7 @@ And something like this:
 
 ```
 CREATE EXTENSION jsonbd;
-CREATE COMPRESSION METHOD cm1 HANDLER jsonbd_compression_handler;
-CREATE TABLE t(a JSONB);
-ALTER TABLE t ALTER COLUMN a SET COMPRESSED cm1;
+CREATE TABLE t(a JSONB COMPRESSED jsonbd);
 ```
 
-This is very early version and should not be used in any real systems.
+This extension is in development and not finished yet.

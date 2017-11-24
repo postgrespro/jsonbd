@@ -649,6 +649,13 @@ jsonbd_worker_main(Datum arg)
 	worker_num = worker_args->worker_num;
 	dboid = worker_args->dboid;
 
+	/* Connect to our database */
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid);
+
+	/* Create resource owner */
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_worker");
+	init_local_variables(worker_num, dboid);
+
 	/* We don't need this segment anymore */
 	dsm_detach(seg);
 
@@ -661,13 +668,6 @@ jsonbd_worker_main(Datum arg)
 
 	/* Set launcher free */
 	SetLatch(&starter->procLatch);
-
-	/* Connect to our database */
-	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid);
-
-	/* Create resource owner */
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "jsonbd_worker");
-	init_local_variables(worker_num, dboid);
 
 	MemoryContextSwitchTo(worker_context);
 
@@ -791,19 +791,14 @@ jsonbd_register_worker(int worker_num, Oid dboid)
 	worker.bgw_notify_pid = MyProcPid;
 	memcpy(worker.bgw_library_name, "jsonbd", BGW_MAXLEN);
 	memcpy(worker.bgw_function_name, CppAsString(jsonbd_worker_main), BGW_MAXLEN);
-
-	/* we need transaction to access syscache */
-	start_xact_command();
-	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd, worker %d, db: \"%s\"",
-			worker_num, get_database_name(dboid));
-	finish_xact_command();
-
+	snprintf(worker.bgw_name, BGW_MAXLEN, "jsonbd, worker %d, db: %d",
+			 worker_num, dboid);
 	worker.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
 
 	/* Start dynamic worker */
 	if (!RegisterDynamicBackgroundWorker(&worker, &bgw_handle))
 	{
-		elog(LOG, "jsonbd: cannot start dictionary worker");
+		elog(LOG, "jsonbd: could not start dictionary worker");
 		return false;
 	}
 
