@@ -22,12 +22,12 @@ typedef enum {
 
 typedef struct jsonbd_shm_worker
 {
-	Oid					dboid;	/* database of the worker */
 	sem_t			   *dbsem;
 	shm_mq			   *mqin;
 	shm_mq			   *mqout;
 	pg_atomic_flag		busy;
 	PGPROC			   *proc;
+	volatile Oid		dboid;	/* database of the worker */
 } jsonbd_shm_worker;
 
 /* Shared memory structures */
@@ -71,6 +71,7 @@ typedef struct jsonbd_worker_args
 {
 	int		worker_num;
 	Oid		dboid;
+	int		database_num;
 } jsonbd_worker_args;
 
 extern void _PG_init(void);

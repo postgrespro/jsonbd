@@ -39,16 +39,16 @@ class Tests(unittest.TestCase):
             node.start()
 
             node.psql('postgres', 'create extension jsonbd')
-            node.psql('postgres', 'create compression method cm1 handler jsonbd_compression_handler')
-            node.psql('postgres', 'create table t1(pk serial, a jsonb compressed cm1);')
+            node.psql('postgres', 'create table t1(pk serial, a jsonb compressed jsonbd);')
 
             data = []
-            for i in range(100):
-                d = generate_dict()
-                data.append(d)
-                node.psql('postgres', "begin; insert into t1 (a) values ('%s'); commit;" % json.dumps(d))
-
             with node.connect('postgres') as con:
+                import ipdb; ipdb.set_trace()
+                for i in range(2):
+                    d = generate_dict()
+                    data.append(d)
+                    con.execute("insert into t1 (a) values ('%s');" % json.dumps(d))
+
                 res = con.execute('select pk, a from t1 order by pk')
                 for pk, val in res:
                     self.assertEqual(val, data[pk - 1])

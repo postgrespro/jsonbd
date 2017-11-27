@@ -112,6 +112,8 @@ jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
 	/* init worker context */
 	pg_atomic_init_flag(&wd->busy);
 	wd->proc = NULL;
+	wd->dboid = InvalidOid;
+	wd->dbsem = NULL;
 
 	shm_mq_clean_receiver(wd->mqin);
 	shm_mq_clean_receiver(wd->mqout);
@@ -294,14 +296,17 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 	sem_t			   *cursem = NULL;
 
 	if (jsonbd_nworkers <= 0)
-		/* TODO: maybe add support of multiple databases for dictionaries */
 		elog(ERROR, "jsonbd workers are not available");
 
 	hdr = shm_toc_lookup(toc, 0, false);
 
 	while (cursem == NULL)
 	{
-		/* find some not busy worker */
+		/*
+		 * find some not busy worker,
+		 * the backend can intercept a worker that just started by another
+		 * backend, that's ok
+		 */
 		for (i = 0; i < hdr->workers_ready; i++)
 		{
 			wd = shm_toc_lookup(toc, i + 1, false);
@@ -367,7 +372,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 			elog(ERROR, "jsonbd: workers launcher was detached");
 
 		if (launch_failed)
-			elog(ERROR, "jsonbd: could not launch dictionary worker, see logs");
+			elog(ERROR, "jsonbd: could not launch dictionary workers, see logs");
 	}
 
 comm:

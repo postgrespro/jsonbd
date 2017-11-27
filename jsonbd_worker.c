@@ -48,7 +48,7 @@ Oid	jsonbd_id_indoid			= InvalidOid;
 void jsonbd_worker_main(Datum arg);
 void jsonbd_launcher_main(Datum arg);
 static Oid jsonbd_get_dictionary_relid(void);
-static bool jsonbd_register_worker(int, Oid, volatile Latch *);
+static bool jsonbd_register_worker(int, Oid, int);
 
 #define JSONBD_DICTIONARY_REL	"jsonbd_dictionary"
 
@@ -131,14 +131,12 @@ init_worker(dsm_segment *seg)
 
 	worker_args = (jsonbd_worker_args *) dsm_segment_address(seg);
 
-	/* increase global count of started workers */
-	hdr->workers_ready++;
-
 	/* Connect to our database */
 	BackgroundWorkerInitializeConnectionByOid(worker_args->dboid, InvalidOid);
 
 	worker_state = shm_toc_lookup(toc, worker_args->worker_num, false);
 	worker_state->proc = MyProc;
+	worker_state->dbsem = &hdr->workers_sem[worker_args->database_num];
 	worker_state->dboid = worker_args->dboid;
 
 	/* input mq */
@@ -181,6 +179,9 @@ init_worker(dsm_segment *seg)
 
 	/* Set launcher free */
 	SetLatch(&hdr->launcher_latch);
+
+	/* make this worker visible in backend cycle */
+	hdr->workers_ready++;
 }
 
 static void
@@ -597,15 +598,10 @@ jsonbd_launcher_main(Datum arg)
 				for (i=0; i < jsonbd_nworkers; i++, worker_num++)
 				{
 					bool res;
-					jsonbd_shm_worker	*wd;
 
-					res = jsonbd_register_worker(worker_num, dboid, &hdr->launcher_latch);
+					res = jsonbd_register_worker(worker_num, dboid, database_num);
 					if (res)
 						started++;
-
-					/* point worker semaphore to database semaphore */
-					wd = shm_toc_lookup(toc, worker_num, false);
-					wd->dbsem = &hdr->workers_sem[database_num];
 				}
 			}
 
@@ -619,9 +615,8 @@ jsonbd_launcher_main(Datum arg)
 				/* semaphore value should be equal to workers count for database */
 				sem_init(&hdr->workers_sem[database_num], 1, started);
 
-				/* we report ok if only one worker has started */
+				/* we report ok if at least one worker has started */
 				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"y", 2}), 1, false);
-
 				database_num += 1;
 			}
 			else
@@ -765,13 +760,14 @@ jsonbd_worker_main(Datum arg)
 }
 
 static bool
-jsonbd_register_worker(int worker_num, Oid dboid, volatile Latch *launcher_latch)
+jsonbd_register_worker(int worker_num, Oid dboid, int database_num)
 {
-	pid_t				pid;
-	dsm_segment		   *seg;
-	BackgroundWorker	worker;
-	BackgroundWorkerHandle *bgw_handle;
-	jsonbd_worker_args *worker_args;
+	pid_t					 pid;
+	BackgroundWorker		 worker;
+	BackgroundWorkerHandle	*bgw_handle;
+	jsonbd_worker_args		*worker_args;
+	jsonbd_shm_hdr			*hdr;
+	dsm_segment				*seg;
 
 	if (worker_num > MAX_JSONBD_WORKERS)
 	{
@@ -779,11 +775,16 @@ jsonbd_register_worker(int worker_num, Oid dboid, volatile Latch *launcher_latch
 		return false;
 	}
 
+	/* Init launcher state */
+	Assert(workers_data != NULL);
+	hdr = shm_toc_lookup(shm_toc_attach(JSONBD_SHM_MQ_MAGIC, workers_data), 0, false);
+
 	/* Initialize DSM segment */
 	seg = dsm_create(sizeof(jsonbd_worker_args), 0);
 	worker_args = (jsonbd_worker_args *) dsm_segment_address(seg);
 	worker_args->worker_num = worker_num;
 	worker_args->dboid = dboid;
+	worker_args->database_num = database_num;
 
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 					   BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -812,12 +813,12 @@ jsonbd_register_worker(int worker_num, Oid dboid, volatile Latch *launcher_latch
 
 	/* Wait to be signalled. */
 #if PG_VERSION_NUM >= 100000
-	WaitLatch(launcher_latch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
+	WaitLatch(&hdr->launcher_latch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
 #else
-	WaitLatch(launcher_latch, WL_LATCH_SET, 0);
+	WaitLatch(&hdr->launcher_latch, WL_LATCH_SET, 0);
 #endif
 
-	ResetLatch(launcher_latch);
+	ResetLatch(&hdr->launcher_latch);
 
 	/* Remove the segment */
 	dsm_detach(seg);
