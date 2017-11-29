@@ -103,6 +103,7 @@ static void
 jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
 		size_t queue_size)
 {
+	LWLockPadded	*locks;
 	static int mqkey = MAX_JSONBD_WORKERS + 1;
 
 	/* each worker will have two mq, for input and output */
@@ -110,10 +111,8 @@ jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
 	wd->mqout = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
 
 	/* init worker context */
-	pg_atomic_init_flag(&wd->busy);
 	wd->proc = NULL;
 	wd->dboid = InvalidOid;
-	wd->dbsem = NULL;
 
 	shm_mq_clean_receiver(wd->mqin);
 	shm_mq_clean_receiver(wd->mqout);
@@ -125,6 +124,10 @@ jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
 
 	shm_toc_insert(toc, mqkey++, wd->mqin);
 	shm_toc_insert(toc, mqkey++, wd->mqout);
+
+	/* initialize worker's lwlock */
+	locks = GetNamedLWLockTranche(JSONBD_LWLOCKS_TRANCHE);
+	wd->lock = &locks[worker_num].lock;
 }
 
 static void
@@ -152,7 +155,6 @@ jsonbd_shmem_startup_hook(void)
 		/* Initialize header */
 		hdr = shm_toc_allocate(toc, sizeof(jsonbd_shm_hdr));
 		hdr->workers_ready = 0;
-		sem_init(&hdr->launcher_sem, 1, 1);
 		jsonbd_init_worker(toc, &hdr->launcher, 0, shm_mq_minimum_size);
 		shm_toc_insert(toc, 0, hdr);
 
@@ -184,6 +186,8 @@ _PG_init(void)
 
 	if (jsonbd_nworkers)
 	{
+		/* jsonbd workers and one lwlock for launcher */
+		RequestNamedLWLockTranche(JSONBD_LWLOCKS_TRANCHE, MAX_JSONBD_WORKERS + 1);
 		RequestAddinShmemSpace(jsonbd_shmem_size());
 		jsonbd_register_launcher();
 	}
@@ -289,36 +293,39 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 	shm_mq_result		resmq;
 	shm_mq_handle	   *mqh;
 	jsonbd_shm_hdr	   *hdr;
-	jsonbd_shm_worker  *wd;
+	jsonbd_shm_worker  *wd = NULL;
 
 	char			   *res;
 	Size				reslen;
-	sem_t			   *cursem = NULL;
 
 	if (jsonbd_nworkers <= 0)
 		elog(ERROR, "jsonbd workers are not available");
 
 	hdr = shm_toc_lookup(toc, 0, false);
 
-	while (cursem == NULL)
+	/*
+	 * find some not busy worker,
+	 * the backend can intercept a worker that just started by another
+	 * backend, that's ok
+	 */
+	while (true)
 	{
-		/*
-		 * find some not busy worker,
-		 * the backend can intercept a worker that just started by another
-		 * backend, that's ok
-		 */
 		for (i = 0; i < hdr->workers_ready; i++)
 		{
+			bool locked;
+
 			wd = shm_toc_lookup(toc, i + 1, false);
 			if (wd->dboid != MyDatabaseId)
 				continue;
 
 			/*
 			 * we found first worker for our database, next 'jsonbd_nworkers'
-			 * workers should be ours, and one of them should be free after sem_wait
+			 * workers should be ours
 			 */
-			cursem = wd->dbsem;
-			sem_wait(cursem);
+			locked = LWLockConditionalAcquire(wd->lock, LW_EXCLUSIVE);
+			if (locked)
+				goto comm;
+
 			for (j = i; j < (i + jsonbd_nworkers); j++)
 			{
 				wd = shm_toc_lookup(toc, j + 1, false);
@@ -327,20 +334,27 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 					/* somehow not all workers started for this database, try next */
 					continue;
 
-				if (pg_atomic_test_set_flag(&wd->busy))
+				locked = LWLockConditionalAcquire(wd->lock, LW_EXCLUSIVE);
+				if (locked)
 					goto comm;
 			}
 
-			/* should never reach here if all worked correctly */
-			sem_post(cursem);
-			elog(ERROR, "jsonbd: could not make a connection with workers");
+			/* if none of the workers were free, we just wait on last one */
+			Assert(!locked);
+			LWLockAcquire(wd->lock, LW_EXCLUSIVE);
+			goto comm;
 		}
 
 		/*
-		 * there are no workers for our database,
+		 * There are no workers for our database,
 		 * so we should launch them using our jsonbd workers launcher
+		 *
+		 * But if the launcher already locked, we should check the workers
+		 * list again
 		 */
-		sem_wait(&hdr->launcher_sem);
+		if (!LWLockAcquireOrWait(hdr->launcher.lock, LW_EXCLUSIVE))
+			continue;
+
 		shm_mq_set_sender(hdr->launcher.mqin, MyProc);
 		shm_mq_set_receiver(hdr->launcher.mqout, MyProc);
 
@@ -366,7 +380,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 
 		shm_mq_clean_sender(hdr->launcher.mqin);
 		shm_mq_clean_receiver(hdr->launcher.mqout);
-		sem_post(&hdr->launcher_sem);
+		LWLockRelease(hdr->launcher.lock);
 
 		if (detached)
 			elog(ERROR, "jsonbd: workers launcher was detached");
@@ -376,6 +390,8 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 	}
 
 comm:
+	Assert(wd != NULL);
+
 	detached = false;
 
 	/* send data */
@@ -405,8 +421,8 @@ comm:
 	/* clean self as receiver and unlock mq */
 	shm_mq_clean_sender(wd->mqin);
 	shm_mq_clean_receiver(wd->mqout);
-	pg_atomic_clear_flag(&wd->busy);
-	sem_post(cursem);
+
+	LWLockRelease(wd->lock);
 
 	if (detached)
 		elog(ERROR, "jsonbd: worker has detached");

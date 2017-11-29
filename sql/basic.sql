@@ -1,6 +1,6 @@
 CREATE SCHEMA comp;
 CREATE EXTENSION jsonbd SCHEMA comp;
-CREATE TABLE comp.t(a JSONB COMPRESSED jsonbd);
+CREATE TABLE comp.t(a JSONB COMPRESSION jsonbd);
 \d+ comp.t;
 
 CREATE OR REPLACE FUNCTION comp.add_record()

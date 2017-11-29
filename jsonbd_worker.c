@@ -136,7 +136,6 @@ init_worker(dsm_segment *seg)
 
 	worker_state = shm_toc_lookup(toc, worker_args->worker_num, false);
 	worker_state->proc = MyProc;
-	worker_state->dbsem = &hdr->workers_sem[worker_args->database_num];
 	worker_state->dboid = worker_args->dboid;
 
 	/* input mq */
@@ -144,9 +143,6 @@ init_worker(dsm_segment *seg)
 
 	/* output mq */
 	shm_mq_set_sender(worker_state->mqout, MyProc);
-
-	/* not busy at start */
-	pg_atomic_clear_flag(&worker_state->busy);
 
 	/* this context will be reset after each task */
 	Assert(worker_context == NULL);
@@ -612,9 +608,6 @@ jsonbd_launcher_main(Datum arg)
 				if (started != jsonbd_nworkers)
 					elog(NOTICE, "jsonbd: not all workers for %d has started", dboid);
 
-				/* semaphore value should be equal to workers count for database */
-				sem_init(&hdr->workers_sem[database_num], 1, started);
-
 				/* we report ok if at least one worker has started */
 				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"y", 2}), 1, false);
 				database_num += 1;
@@ -762,7 +755,6 @@ jsonbd_worker_main(Datum arg)
 static bool
 jsonbd_register_worker(int worker_num, Oid dboid, int database_num)
 {
-	pid_t					 pid;
 	BackgroundWorker		 worker;
 	BackgroundWorkerHandle	*bgw_handle;
 	jsonbd_worker_args		*worker_args;
@@ -801,13 +793,6 @@ jsonbd_register_worker(int worker_num, Oid dboid, int database_num)
 	if (!RegisterDynamicBackgroundWorker(&worker, &bgw_handle))
 	{
 		elog(LOG, "jsonbd: could not start dictionary worker");
-		return false;
-	}
-
-	/* Wait till the worker starts */
-	if (WaitForBackgroundWorkerStartup(bgw_handle, &pid) == BGWH_POSTMASTER_DIED)
-	{
-		elog(LOG, "jsonbd: postmaster died during bgworker startup");
 		return false;
 	}
 

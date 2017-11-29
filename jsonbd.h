@@ -11,6 +11,7 @@
 
 #define JSONBD_SHM_MQ_MAGIC		0xAAAA
 
+#define JSONBD_LWLOCKS_TRANCHE	"jsonbd lwlocks tranche"
 #define MAX_JSONBD_WORKERS_PER_DATABASE		3
 #define MAX_DATABASES						10 /* FIXME: need more? */
 #define MAX_JSONBD_WORKERS	(MAX_DATABASES * MAX_JSONBD_WORKERS_PER_DATABASE)
@@ -22,19 +23,16 @@ typedef enum {
 
 typedef struct jsonbd_shm_worker
 {
-	sem_t			   *dbsem;
 	shm_mq			   *mqin;
 	shm_mq			   *mqout;
-	pg_atomic_flag		busy;
 	PGPROC			   *proc;
 	volatile Oid		dboid;	/* database of the worker */
+	LWLock			   *lock;
 } jsonbd_shm_worker;
 
 /* Shared memory structures */
 typedef struct jsonbd_shm_hdr
 {
-	sem_t				launcher_sem;
-	sem_t				workers_sem[MAX_DATABASES];
 	volatile int		workers_ready;
 	jsonbd_shm_worker	launcher;
 	Latch				launcher_latch;
