@@ -44,9 +44,10 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static shm_toc *toc = NULL;
 
 /* global */
-void *workers_data = NULL;
-int jsonbd_nworkers = -1;
-int jsonbd_queue_size = 0;
+void   *workers_data = NULL;
+int		jsonbd_nworkers = -1;
+int		jsonbd_queue_size = 0;
+Size	jsonbd_total_queue_size = 0;
 
 static void init_memory_context(bool);
 static void memory_reset_callback(void *arg);
@@ -78,11 +79,14 @@ jsonbd_shmem_size(void)
 	/* two queues for launcher */
 	shm_toc_estimate_chunk(&e, shm_mq_minimum_size * 2);
 
+	/* set total queue size */
+	jsonbd_total_queue_size = (Size) (shm_mq_minimum_size + jsonbd_queue_size * 1024);
+
 	for (i = 0; i < MAX_JSONBD_WORKERS; i++)
 	{
 		shm_toc_estimate_chunk(&e, sizeof(jsonbd_shm_worker));
-		shm_toc_estimate_chunk(&e, jsonbd_get_queue_size());
-		shm_toc_estimate_chunk(&e, jsonbd_get_queue_size());
+		shm_toc_estimate_chunk(&e, jsonbd_total_queue_size);
+		shm_toc_estimate_chunk(&e, jsonbd_total_queue_size);
 	}
 
 	/* 3 keys each worker + 3 for header (header itself and two queues) */
@@ -106,21 +110,16 @@ jsonbd_init_worker(shm_toc *toc, jsonbd_shm_worker *wd, int worker_num,
 	LWLockPadded	*locks;
 	static int mqkey = MAX_JSONBD_WORKERS + 1;
 
-	/* each worker will have two mq, for input and output */
-	wd->mqin = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
-	wd->mqout = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
-
 	/* init worker context */
 	wd->proc = NULL;
 	wd->dboid = InvalidOid;
 
-	shm_mq_clean_receiver(wd->mqin);
-	shm_mq_clean_receiver(wd->mqout);
-	shm_mq_clean_sender(wd->mqin);
-	shm_mq_clean_sender(wd->mqout);
-
 	if (worker_num)
 		shm_toc_insert(toc, worker_num, wd);
+
+	/* each worker will have two mq, for input and output */
+	wd->mqin = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
+	wd->mqout = shm_mq_create(shm_toc_allocate(toc, queue_size), queue_size);
 
 	shm_toc_insert(toc, mqkey++, wd->mqin);
 	shm_toc_insert(toc, mqkey++, wd->mqout);
@@ -294,6 +293,8 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 	shm_mq_handle	   *mqh;
 	jsonbd_shm_hdr	   *hdr;
 	jsonbd_shm_worker  *wd = NULL;
+	shm_mq			   *mqin,
+					   *mqout;
 
 	char			   *res;
 	Size				reslen;
@@ -355,10 +356,19 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 		if (!LWLockAcquireOrWait(hdr->launcher.lock, LW_EXCLUSIVE))
 			continue;
 
-		shm_mq_set_sender(hdr->launcher.mqin, MyProc);
-		shm_mq_set_receiver(hdr->launcher.mqout, MyProc);
+		mqin = shm_mq_create(hdr->launcher.mqin, shm_mq_minimum_size);
+		mqout = shm_mq_create(hdr->launcher.mqout, shm_mq_minimum_size);
 
-		mqh = shm_mq_attach(hdr->launcher.mqin, NULL, NULL);
+		/*
+		 * important that sender on mqout should be set earlier than
+		 * receiver on mqin
+		 */
+		shm_mq_set_sender(mqout, hdr->launcher.proc);
+		shm_mq_set_receiver(mqout, MyProc);
+		shm_mq_set_sender(mqin, MyProc);
+		shm_mq_set_receiver(mqin, hdr->launcher.proc);
+
+		mqh = shm_mq_attach(mqin, NULL, NULL);
 		resmq = shm_mq_sendv(mqh,
 				&((shm_mq_iovec) {(char *) &MyDatabaseId, sizeof(MyDatabaseId)}), 1, false);
 		if (resmq != SHM_MQ_SUCCESS)
@@ -367,7 +377,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 
 		if (!detached)
 		{
-			mqh = shm_mq_attach(hdr->launcher.mqout, NULL, NULL);
+			mqh = shm_mq_attach(mqout, NULL, NULL);
 			resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
 			if (resmq != SHM_MQ_SUCCESS)
 				detached = true;
@@ -377,9 +387,6 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 
 			shm_mq_detach(mqh);
 		}
-
-		shm_mq_clean_sender(hdr->launcher.mqin);
-		shm_mq_clean_receiver(hdr->launcher.mqout);
 		LWLockRelease(hdr->launcher.lock);
 
 		if (detached)
@@ -395,10 +402,15 @@ comm:
 	detached = false;
 
 	/* send data */
-	shm_mq_set_sender(wd->mqin, MyProc);
-	shm_mq_set_receiver(wd->mqout, MyProc);
+	mqin = shm_mq_create(wd->mqin, jsonbd_total_queue_size);
+	mqout = shm_mq_create(wd->mqout, jsonbd_total_queue_size);
 
-	mqh = shm_mq_attach(wd->mqin, NULL, NULL);
+	shm_mq_set_sender(mqin, MyProc);
+	shm_mq_set_receiver(mqin, wd->proc);
+	shm_mq_set_sender(mqout, wd->proc);
+	shm_mq_set_receiver(mqout, MyProc);
+
+	mqh = shm_mq_attach(mqin, NULL, NULL);
 	resmq = shm_mq_sendv(mqh, iov, iov_len, false);
 	if (resmq != SHM_MQ_SUCCESS)
 		detached = true;
@@ -407,7 +419,7 @@ comm:
 	/* get data */
 	if (!detached)
 	{
-		mqh = shm_mq_attach(wd->mqout, NULL, NULL);
+		mqh = shm_mq_attach(mqout, NULL, NULL);
 		resmq = shm_mq_receive(mqh, &reslen, (void **) &res, false);
 		if (resmq != SHM_MQ_SUCCESS)
 			detached = true;
@@ -417,10 +429,6 @@ comm:
 
 		shm_mq_detach(mqh);
 	}
-
-	/* clean self as receiver and unlock mq */
-	shm_mq_clean_sender(wd->mqin);
-	shm_mq_clean_receiver(wd->mqout);
 
 	LWLockRelease(wd->lock);
 

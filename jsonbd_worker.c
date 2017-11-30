@@ -138,12 +138,6 @@ init_worker(dsm_segment *seg)
 	worker_state->proc = MyProc;
 	worker_state->dboid = worker_args->dboid;
 
-	/* input mq */
-	shm_mq_set_receiver(worker_state->mqin, MyProc);
-
-	/* output mq */
-	shm_mq_set_sender(worker_state->mqout, MyProc);
-
 	/* this context will be reset after each task */
 	Assert(worker_context == NULL);
 	worker_context = AllocSetContextCreate(TopMemoryContext,
@@ -557,10 +551,9 @@ jsonbd_launcher_main(Datum arg)
 	toc = shm_toc_attach(JSONBD_SHM_MQ_MAGIC, workers_data);
 	hdr = shm_toc_lookup(toc, 0, false);
 	worker_state = &hdr->launcher;
+	worker_state->proc = MyProc;
 
 	InitLatch(&hdr->launcher_latch);
-	shm_mq_set_receiver(worker_state->mqin, MyProc);
-	shm_mq_set_sender(worker_state->mqout, MyProc);
 
 	elog(LOG, "jsonbd launcher started with pid: %d", MyProcPid);
 
@@ -572,10 +565,24 @@ jsonbd_launcher_main(Datum arg)
 
 		shm_mq_result	resmq;
 
-		if (!mqh)
-			mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
+		if (shutdown_requested)
+			break;
 
-		resmq = shm_mq_receive(mqh, &nbytes, &data, true);
+		rc = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
+			0, PG_WAIT_EXTENSION);
+
+		if (rc & WL_POSTMASTER_DEATH)
+			break;
+
+		ResetLatch(&MyProc->procLatch);
+
+		if (shm_mq_get_receiver(worker_state->mqin) != MyProc)
+			continue;
+
+		Assert(shm_mq_get_sender(worker_state->mqout) == MyProc);
+
+		mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
+		resmq = shm_mq_receive(mqh, &nbytes, &data, false);
 
 		if (resmq == SHM_MQ_SUCCESS)
 		{
@@ -602,6 +609,10 @@ jsonbd_launcher_main(Datum arg)
 			}
 
 			shm_mq_detach(mqh);
+
+			/* we don't need start this cycle again after we send data */
+			shm_mq_clean_receiver(worker_state->mqin);
+
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
 			if (started)
 			{
@@ -623,17 +634,6 @@ jsonbd_launcher_main(Datum arg)
 			/* mark we need new handle */
 			mqh = NULL;
 		}
-
-		if (shutdown_requested)
-			break;
-
-		rc = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
-			0, PG_WAIT_EXTENSION);
-
-		if (rc & WL_POSTMASTER_DEATH)
-			break;
-
-		ResetLatch(&MyProc->procLatch);
 	}
 
 	elog(LOG, "jsonbd launcher has ended its work");
@@ -669,10 +669,24 @@ jsonbd_worker_main(Datum arg)
 
 		shm_mq_result	resmq;
 
-		if (!mqh)
-			mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
+		if (shutdown_requested)
+			break;
 
-		resmq = shm_mq_receive(mqh, &nbytes, &data, true);
+		rc = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
+			0, PG_WAIT_EXTENSION);
+
+		if (rc & WL_POSTMASTER_DEATH)
+			break;
+
+		ResetLatch(&MyProc->procLatch);
+
+		if (shm_mq_get_receiver(worker_state->mqin) != MyProc)
+			continue;
+
+		Assert(shm_mq_get_sender(worker_state->mqout) == MyProc);
+
+		mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
+		resmq = shm_mq_receive(mqh, &nbytes, &data, false);
 
 		if (resmq == SHM_MQ_SUCCESS)
 		{
@@ -719,6 +733,7 @@ jsonbd_worker_main(Datum arg)
 			}
 
 			shm_mq_detach(mqh);
+			shm_mq_clean_receiver(worker_state->mqin);
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
 
 			if (iov != NULL)
@@ -731,21 +746,7 @@ jsonbd_worker_main(Datum arg)
 
 			shm_mq_detach(mqh);
 			MemoryContextReset(worker_context);
-
-			/* mark we need new handle */
-			mqh = NULL;
 		}
-
-		if (shutdown_requested)
-			break;
-
-		rc = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
-			0, PG_WAIT_EXTENSION);
-
-		if (rc & WL_POSTMASTER_DEATH)
-			break;
-
-		ResetLatch(&MyProc->procLatch);
 	}
 
 	elog(LOG, "jsonbd dictionary worker has ended its work");
