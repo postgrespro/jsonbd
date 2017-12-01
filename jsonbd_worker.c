@@ -47,7 +47,6 @@ Oid	jsonbd_id_indoid			= InvalidOid;
 
 void jsonbd_worker_main(Datum arg);
 void jsonbd_launcher_main(Datum arg);
-static Oid jsonbd_get_dictionary_relid(void);
 static bool jsonbd_register_worker(int, Oid, int);
 
 #define JSONBD_DICTIONARY_REL	"jsonbd_dictionary"
@@ -832,7 +831,7 @@ jsonbd_register_launcher(void)
 	RegisterBackgroundWorker(&worker);
 }
 
-static Oid
+Oid
 jsonbd_get_dictionary_relid(void)
 {
 	Oid relid,

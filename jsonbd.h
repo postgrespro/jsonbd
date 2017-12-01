@@ -74,6 +74,7 @@ typedef struct jsonbd_worker_args
 
 extern void _PG_init(void);
 extern void jsonbd_register_launcher(void);
+extern Oid jsonbd_get_dictionary_relid(void);
 
 extern void *workers_data;
 extern int jsonbd_nworkers;

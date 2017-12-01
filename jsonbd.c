@@ -743,8 +743,14 @@ jsonbd_compress(CompressionMethodOptions *cmoptions, const struct varlena *data)
 static void
 jsonbd_configure(Form_pg_attribute attr, List *options)
 {
-	if (options != NIL)
-		elog(ERROR, "the compression method for jsonbd doesn't take any options");
+	if (!OidIsValid(jsonbd_get_dictionary_relid()))
+		elog(ERROR, "could not create jsonbd dictionary");
+}
+
+static void
+jsonbd_drop(Form_pg_attribute attr, List *options)
+{
+	/* TODO: if there is no compression options, remove the dictionary */
 }
 
 static struct varlena *
@@ -836,7 +842,7 @@ jsonbd_compression_handler(PG_FUNCTION_ARGS)
 		elog(ERROR, "unexpected type %d for jsonbd compression handler", typeid);
 
 	cmr->configure = jsonbd_configure;
-	cmr->drop = NULL;
+	cmr->drop = jsonbd_drop;
 	cmr->compress = jsonbd_compress;
 	cmr->decompress = jsonbd_decompress;
 
