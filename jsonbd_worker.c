@@ -141,9 +141,7 @@ init_worker(dsm_segment *seg)
 	Assert(worker_context == NULL);
 	worker_context = AllocSetContextCreate(TopMemoryContext,
 										   "jsonbd worker context",
-										   ALLOCSET_DEFAULT_MINSIZE,
-										   ALLOCSET_DEFAULT_INITSIZE,
-										   ALLOCSET_DEFAULT_MAXSIZE);
+										   ALLOCSET_DEFAULT_SIZES);
 
 	worker_cache_context = AllocSetContextCreate(TopMemoryContext,
 										"jsonbd worker cache context",

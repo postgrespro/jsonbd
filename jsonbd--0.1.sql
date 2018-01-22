@@ -1,5 +1,5 @@
 CREATE OR REPLACE FUNCTION jsonbd_compression_handler(INTERNAL)
-RETURNS COMPRESSION_HANDLER AS 'MODULE_PATHNAME', 'jsonbd_compression_handler'
+RETURNS COMPRESSION_AM_HANDLER AS 'MODULE_PATHNAME', 'jsonbd_compression_handler'
 LANGUAGE C STRICT;
 
-CREATE COMPRESSION METHOD jsonbd HANDLER jsonbd_compression_handler;
+CREATE ACCESS METHOD jsonbd TYPE COMPRESSION HANDLER jsonbd_compression_handler;

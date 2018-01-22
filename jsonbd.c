@@ -4,7 +4,7 @@
 #include "postgres.h"
 #include "fmgr.h"
 
-#include "access/compression.h"
+#include "access/cmapi.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
@@ -643,7 +643,7 @@ packJsonbValue(JsonbValue *val, int header_size, int *len)
 
 /* Compress jsonb using dictionary */
 static struct varlena *
-jsonbd_compress(CompressionMethodOptions *cmoptions, const struct varlena *data)
+jsonbd_cmcompress(CompressionAmOptions *cmoptions, const struct varlena *data)
 {
 	int					size;
 	JsonbIteratorToken	r;
@@ -712,7 +712,7 @@ jsonbd_compress(CompressionMethodOptions *cmoptions, const struct varlena *data)
 			Assert(offset == len);
 
 			/* retrieve or generate ids */
-			jsonbd_worker_get_key_ids(cmoptions->cmoptoid, buf, len, idsbuf, nkeys);
+			jsonbd_worker_get_key_ids(cmoptions->acoid, buf, len, idsbuf, nkeys);
 
 			/* replace the old keys with encoded ids */
 			for (i = 0; i < nkeys; i++)
@@ -740,21 +740,23 @@ jsonbd_compress(CompressionMethodOptions *cmoptions, const struct varlena *data)
 	return res;
 }
 
-static void
-jsonbd_configure(Form_pg_attribute attr, List *options)
+static void *
+jsonbd_cminitstate(Oid acoid, List *options)
 {
 	if (!OidIsValid(jsonbd_get_dictionary_relid()))
 		elog(ERROR, "could not create jsonbd dictionary");
+
+	return NULL;
 }
 
 static void
-jsonbd_drop(Form_pg_attribute attr, List *options)
+jsonbd_cmdrop(Oid acoid)
 {
 	/* TODO: if there is no compression options, remove the dictionary */
 }
 
 static struct varlena *
-jsonbd_decompress(CompressionMethodOptions *cmoptions, const struct varlena *data)
+jsonbd_cmdecompress(CompressionAmOptions *cmoptions, const struct varlena *data)
 {
 	JsonbIteratorToken	r;
 	JsonbValue			v,
@@ -802,7 +804,7 @@ jsonbd_decompress(CompressionMethodOptions *cmoptions, const struct varlena *dat
 			}
 
 			/* retrieve keys */
-			buf = jsonbd_worker_get_keys(cmoptions->cmoptoid, compression_buffers->idsbuf, nkeys, &buflen);
+			buf = jsonbd_worker_get_keys(cmoptions->acoid, compression_buffers->idsbuf, nkeys, &buflen);
 			if (buf == NULL)
 				elog(ERROR, "jsonbd: decompression error");
 
@@ -830,21 +832,24 @@ jsonbd_decompress(CompressionMethodOptions *cmoptions, const struct varlena *dat
 	return res;
 }
 
+static void
+jsonbd_cmcheck(Form_pg_attribute att, List *options)
+{
+	if (att->atttypid != JSONBOID)
+		elog(ERROR, "unexpected type %d for jsonbd compression handler",
+				att->atttypid);
+}
+
 Datum
 jsonbd_compression_handler(PG_FUNCTION_ARGS)
 {
-	CompressionMethodRoutine   *cmr = makeNode(CompressionMethodRoutine);
-	CompressionMethodOpArgs	   *opargs =
-		(CompressionMethodOpArgs *) PG_GETARG_POINTER(0);
-	Oid							typeid = opargs->typeid;
+	CompressionAmRoutine *routine = makeNode(CompressionAmRoutine);
 
-	if (OidIsValid(typeid) && typeid != JSONBOID)
-		elog(ERROR, "unexpected type %d for jsonbd compression handler", typeid);
+	routine->cmcheck = jsonbd_cmcheck;
+	routine->cmdrop = jsonbd_cmdrop;		/* no drop behavior */
+	routine->cminitstate = jsonbd_cminitstate;
+	routine->cmcompress = jsonbd_cmcompress;
+	routine->cmdecompress = jsonbd_cmdecompress;
 
-	cmr->configure = jsonbd_configure;
-	cmr->drop = jsonbd_drop;
-	cmr->compress = jsonbd_compress;
-	cmr->decompress = jsonbd_decompress;
-
-	PG_RETURN_POINTER(cmr);
+	PG_RETURN_POINTER(routine);
 }
