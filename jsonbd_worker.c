@@ -33,6 +33,7 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
+#include "utils/syscache.h"
 
 static bool						xact_started = false;
 static bool						shutdown_requested = false;
@@ -48,24 +49,17 @@ Oid	jsonbd_id_indoid			= InvalidOid;
 void jsonbd_worker_main(Datum arg);
 void jsonbd_launcher_main(Datum arg);
 static bool jsonbd_register_worker(int, Oid, int);
+static char *jsonbd_get_dictionary_name(Oid relid);
 
 #define JSONBD_DICTIONARY_REL	"jsonbd_dictionary"
 
-static const char *sql_dictionary = \
-	"CREATE TABLE public." JSONBD_DICTIONARY_REL
-	" (cmopt	OID NOT NULL,"
-	"  id		INT4 NOT NULL,"
-	"  key		TEXT NOT NULL);"
-	"CREATE UNIQUE INDEX jsonbd_dict_on_id ON " JSONBD_DICTIONARY_REL "(cmopt, id);"
-	"CREATE UNIQUE INDEX jsonbd_dict_on_key ON " JSONBD_DICTIONARY_REL " (cmopt, key);";
-
 static const char *sql_insert = \
-	"WITH t AS (SELECT (COALESCE(MAX(id), 0) + 1) new_id FROM "
-	JSONBD_DICTIONARY_REL " WHERE cmopt = %d) INSERT INTO " JSONBD_DICTIONARY_REL
+	"WITH t AS (SELECT (COALESCE(MAX(id), 0) + 1) new_id FROM %s"
+	" WHERE acoid = %d) INSERT INTO %s"
 	" SELECT %d, t.new_id, '%s' FROM t RETURNING id";
 
 enum {
-	JSONBD_DICTIONARY_REL_ATT_CMOPT = 1,
+	JSONBD_DICTIONARY_REL_ATT_ACOID = 1,
 	JSONBD_DICTIONARY_REL_ATT_ID,
 	JSONBD_DICTIONARY_REL_ATT_KEY,
 	JSONBD_DICTIONARY_REL_ATT_COUNT
@@ -353,8 +347,17 @@ jsonbd_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 	Relation	indrel;
 	int			i;
 	Oid			relid = jsonbd_get_dictionary_relid();
-	bool		spi_on = false;
+	bool		spi_on = false,
+				failed = false;
 	jsonbd_cached_cmopt		*cmcache;
+	static char *relname = NULL;
+
+	if (relname == NULL)
+	{
+		start_xact_command();
+		relname = jsonbd_get_dictionary_name(relid);
+		finish_xact_command();
+	}
 
 	cmcache = get_cached_compression_options(cmoptoid);
 
@@ -418,20 +421,27 @@ jsonbd_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 				/* still need to add */
 				Datum	datum;
 				bool	isnull;
-				char   *sql2 = psprintf(sql_insert, cmoptoid, cmoptoid, buf);
+				char   *sql2 = psprintf(sql_insert, relname, cmoptoid,
+										relname, cmoptoid, buf);
 
 				/* TODO: maybe use bulk inserts instead of SPI */
 				if (!spi_on)
 				{
 					/* lazy SPI initialization */
 					if (SPI_connect() != SPI_OK_CONNECT)
-						elog(ERROR, "SPI_connect failed");
+					{
+						failed = true;
+						goto finish;
+					}
 
 					spi_on = true;
 				}
 
 				if (SPI_exec(sql2, 0) != SPI_OK_INSERT_RETURNING)
-					elog(ERROR, "SPI_exec failed");
+				{
+					failed = true;
+					goto finish;
+				}
 
 				pfree(sql2);
 
@@ -454,6 +464,7 @@ next:
 		while (*buf++ != '\0');
 	}
 
+finish:
 	if (spi_on)
 		SPI_finish();
 
@@ -463,6 +474,9 @@ next:
 		relation_close(rel, AccessShareLock);
 		finish_xact_command();
 	}
+
+	if (failed)
+		elog(ERROR, "get key ids error");
 }
 
 static char *
@@ -654,6 +668,9 @@ jsonbd_worker_main(Datum arg)
 
 	/* Initialize connection and local variables */
 	seg = dsm_attach((dsm_handle) DatumGetInt32(arg));
+	if (!seg)
+		goto finish;
+
 	init_worker(seg);
 
 	MemoryContextSwitchTo(worker_context);
@@ -746,6 +763,7 @@ jsonbd_worker_main(Datum arg)
 		}
 	}
 
+finish:
 	elog(LOG, "jsonbd dictionary worker has ended its work");
 	proc_exit(0);
 }
@@ -832,35 +850,16 @@ jsonbd_register_launcher(void)
 Oid
 jsonbd_get_dictionary_relid(void)
 {
-	Oid relid,
-		nspoid;
+	Oid relid;
 
 	if (OidIsValid(jsonbd_dictionary_reloid))
 		return jsonbd_dictionary_reloid;
 
 	start_xact_command();
 
-	nspoid = get_namespace_oid("public", false);
-	relid = get_relname_relid(JSONBD_DICTIONARY_REL, nspoid);
+	relid = get_relname_relid(JSONBD_DICTIONARY_REL, get_jsonbd_schema());
 	if (relid == InvalidOid)
-	{
-		if (SPI_connect() != SPI_OK_CONNECT)
-			elog(ERROR, "SPI_connect failed");
-
-		if (SPI_execute(sql_dictionary, false, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "could not create \"jsonbd\" dictionary");
-
-		SPI_finish();
-		CommandCounterIncrement();
-
-		finish_xact_command();
-		start_xact_command();
-
-		/* get just created table Oid */
-		relid = get_relname_relid(JSONBD_DICTIONARY_REL, nspoid);
-		jsonbd_id_indoid = InvalidOid;
-		jsonbd_keys_indoid = InvalidOid;
-	}
+		elog(ERROR, "jsonbd dictionary relation does not exist");
 
 	/* fill index Oids too */
 	if (jsonbd_id_indoid == InvalidOid)
@@ -903,4 +902,34 @@ jsonbd_get_dictionary_relid(void)
 
 	jsonbd_dictionary_reloid = relid;
 	return relid;
+}
+
+static char *
+jsonbd_get_dictionary_name(Oid relid)
+{
+	HeapTuple	tp;
+	Form_pg_class reltup;
+	char	   *relname;
+	char	   *nspname;
+	char	   *result;
+	MemoryContext	old_mcxt;
+
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	reltup = (Form_pg_class) GETSTRUCT(tp);
+	relname = NameStr(reltup->relname);
+
+	nspname = get_namespace_name(reltup->relnamespace);
+	if (!nspname)
+		elog(ERROR, "cache lookup failed for namespace %u",
+			 reltup->relnamespace);
+
+	old_mcxt = MemoryContextSwitchTo(TopMemoryContext);
+	result = quote_qualified_identifier(nspname, relname);
+	MemoryContextSwitchTo(old_mcxt);
+
+	ReleaseSysCache(tp);
+
+	return result;
 }

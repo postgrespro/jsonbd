@@ -2,15 +2,22 @@
 #include "jsonbd_utils.h"
 
 #include "postgres.h"
+#include "access/htup_details.h"
+#include "access/xact.h"
+#include "access/sysattr.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_extension.h"
+#include "commands/extension.h"
 #include "nodes/execnodes.h"
 #include "nodes/makefuncs.h"
+#include "utils/fmgroids.h"
 #include "utils/rel.h"
 
 #if PG_VERSION_NUM == 110000
 struct shm_mq_alt
 {
 	slock_t		mq_mutex;
-	PGPROC	   *mq_receiver;	/* this one */
+	PGPROC	   *mq_receiver;	/* we need this one */
 	PGPROC	   *mq_sender;		/* this one */
 	uint64		mq_bytes_read;
 	uint64		mq_bytes_written;
@@ -126,4 +133,44 @@ shm_mq_clean_receiver(shm_mq *mq)
 
 	amq->mq_receiver = NULL;
 	amq->mq_detached = false;
+}
+
+Oid
+get_jsonbd_schema(void)
+{
+	Oid				result;
+	Relation		rel;
+	SysScanDesc		scandesc;
+	HeapTuple		tuple;
+	ScanKeyData		entry[1];
+	Oid				ext_oid;
+
+	if (!IsTransactionState())
+		return InvalidOid;
+
+	ext_oid = get_extension_oid("jsonbd", true);
+	if (ext_oid == InvalidOid)
+		return InvalidOid; /* exit if pg_pathman does not exist */
+
+	ScanKeyInit(&entry[0],
+				ObjectIdAttributeNumber,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ext_oid));
+
+	rel = heap_open(ExtensionRelationId, AccessShareLock);
+	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
+								  NULL, 1, entry);
+
+	tuple = systable_getnext(scandesc);
+
+	/* We assume that there can be at most one matching tuple */
+	if (HeapTupleIsValid(tuple))
+		result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
+	else
+		result = InvalidOid;
+
+	systable_endscan(scandesc);
+
+	heap_close(rel, AccessShareLock);
+	return result;
 }
