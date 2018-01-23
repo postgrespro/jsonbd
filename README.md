@@ -12,7 +12,7 @@ And something like this:
 
 ```
 CREATE EXTENSION jsonbd;
-CREATE TABLE t(a JSONB COMPRESSED jsonbd);
+CREATE TABLE t(a JSONB COMPRESSION jsonbd);
 ```
 
 This extension is in development and not finished yet.
