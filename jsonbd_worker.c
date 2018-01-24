@@ -340,7 +340,7 @@ jsonbd_get_key_id(Relation rel, Relation indrel, Oid cmoptoid, char *key)
 /*
  * Get key IDs using relation
  */
-static void
+static bool
 jsonbd_get_key_ids(Oid cmoptoid, char *buf, uint32 *idsbuf, int nkeys)
 {
 	Relation	rel = NULL;
@@ -472,42 +472,35 @@ finish:
 	{
 		index_close(indrel, AccessShareLock);
 		relation_close(rel, AccessShareLock);
-		finish_xact_command();
 	}
 
-	if (failed)
-		elog(ERROR, "get key ids error");
+	if (failed && xact_started)
+		AbortCurrentTransaction();
+	else if (!failed)
+		finish_xact_command();
+
+	return !failed;
 }
 
 static char *
 jsonbd_cmd_get_ids(int nkeys, Oid cmoptoid, char *buf, size_t *buflen)
 {
+	bool			ok;
 	uint32		   *idsbuf;
 	MemoryContext	old_mcxt = CurrentMemoryContext;;
 
 	*buflen = nkeys * sizeof(uint32);
 	idsbuf = (uint32 *) palloc(*buflen);
-
-	PG_TRY();
+	ok = jsonbd_get_key_ids(cmoptoid, buf, idsbuf, nkeys);
+	if (!ok)
 	{
-		start_xact_command();
-		jsonbd_get_key_ids(cmoptoid, buf, idsbuf, nkeys);
-		finish_xact_command();
-	}
-	PG_CATCH();
-	{
-		ErrorData  *error;
-		MemoryContextSwitchTo(old_mcxt);
-		error = CopyErrorData();
-		elog(LOG, "jsonbd: error occured: %s", error->message);
-		FlushErrorState();
-		pfree(error);
+		elog(LOG, "jsonbd: cannot get ids");
 
 		idsbuf[0] = 0;
 		*buflen = 1;
 	}
-	PG_END_TRY();
 
+	MemoryContextSwitchTo(old_mcxt);
 	return (char *) idsbuf;
 }
 
