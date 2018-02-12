@@ -28,6 +28,7 @@ typedef struct jsonbd_shm_worker
 	PGPROC			   *proc;
 	volatile Oid		dboid;	/* database of the worker */
 	LWLock			   *lock;
+	Latch				latch;
 } jsonbd_shm_worker;
 
 /* Shared memory structures */

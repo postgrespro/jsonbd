@@ -360,15 +360,15 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 		mqout = shm_mq_create(hdr->launcher.mqout, shm_mq_minimum_size);
 
 		/*
-		 * important that sender on mqout should be set earlier than
-		 * receiver on mqin
-		 */
-		shm_mq_set_sender(mqout, hdr->launcher.proc);
+		 * set sender, create handle and wake up launcher and wait until
+		 * it's connected
+		 * */
 		shm_mq_set_receiver(mqout, MyProc);
 		shm_mq_set_sender(mqin, MyProc);
-		shm_mq_set_receiver(mqin, hdr->launcher.proc);
-
 		mqh = shm_mq_attach(mqin, NULL, NULL);
+		SetLatch(&hdr->launcher.proc->procLatch);
+		shm_mq_wait_for_attach(mqh);
+
 		resmq = shm_mq_sendv(mqh,
 				&((shm_mq_iovec) {(char *) &MyDatabaseId, sizeof(MyDatabaseId)}), 1, false);
 		if (resmq != SHM_MQ_SUCCESS)
@@ -405,12 +405,17 @@ comm:
 	mqin = shm_mq_create(wd->mqin, jsonbd_total_queue_size);
 	mqout = shm_mq_create(wd->mqout, jsonbd_total_queue_size);
 
-	shm_mq_set_sender(mqin, MyProc);
-	shm_mq_set_receiver(mqin, wd->proc);
-	shm_mq_set_sender(mqout, wd->proc);
+	/*
+	 * create handle and wake up worker and wait until
+	 * it's connected
+	 * */
 	shm_mq_set_receiver(mqout, MyProc);
-
+	shm_mq_set_sender(mqin, MyProc);
 	mqh = shm_mq_attach(mqin, NULL, NULL);
+	SetLatch(&wd->latch);
+	shm_mq_wait_for_attach(mqh);
+
+	/* send data */
 	resmq = shm_mq_sendv(mqh, iov, iov_len, false);
 	if (resmq != SHM_MQ_SUCCESS)
 		detached = true;

@@ -160,6 +160,7 @@ init_worker(dsm_segment *seg)
 
 	/* Set launcher free */
 	SetLatch(&hdr->launcher_latch);
+	InitLatch(&worker_state->latch);
 
 	/* make this worker visible in backend cycle */
 	hdr->workers_ready++;
@@ -534,7 +535,7 @@ jsonbd_launcher_main(Datum arg)
 	shm_toc			*toc;
 	jsonbd_shm_hdr	*hdr;
 
-	shm_mq_handle  *mqh = NULL;
+	shm_mq_handle  *mqh;
 	int				worker_num	= 1;
 	int				database_num = 0;
 
@@ -572,21 +573,40 @@ jsonbd_launcher_main(Datum arg)
 		if (shutdown_requested)
 			break;
 
-		rc = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
-			0, PG_WAIT_EXTENSION);
+		/* Wait to be signalled. */
+		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
+					   0, PG_WAIT_EXTENSION);
 
 		if (rc & WL_POSTMASTER_DEATH)
 			break;
 
-		ResetLatch(&MyProc->procLatch);
+		/* Reset the latch so we don't spin. */
+		ResetLatch(MyLatch);
 
-		if (shm_mq_get_receiver(worker_state->mqin) != MyProc)
+		if (shm_mq_get_sender(worker_state->mqin) == NULL)
+		{
+			CHECK_FOR_INTERRUPTS();
 			continue;
+		}
 
-		Assert(shm_mq_get_sender(worker_state->mqout) == MyProc);
+		/*
+		 * set myself as receiver on mqin and sender on mqout,
+		 * and get data from backend
+		 * */
+		if (!shm_mq_get_sender(worker_state->mqout))
+			shm_mq_set_sender(worker_state->mqout, MyProc);
+
+		if (!shm_mq_get_receiver(worker_state->mqin))
+			shm_mq_set_receiver(worker_state->mqin, MyProc);
 
 		mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
 		resmq = shm_mq_receive(mqh, &nbytes, &data, false);
+
+		if (resmq == SHM_MQ_DETACHED)
+		{
+			shm_mq_detach(mqh);
+			continue;
+		}
 
 		if (resmq == SHM_MQ_SUCCESS)
 		{
@@ -614,9 +634,6 @@ jsonbd_launcher_main(Datum arg)
 
 			shm_mq_detach(mqh);
 
-			/* we don't need start this cycle again after we send data */
-			shm_mq_clean_receiver(worker_state->mqin);
-
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
 			if (started)
 			{
@@ -629,15 +646,11 @@ jsonbd_launcher_main(Datum arg)
 			}
 			else
 				resmq = shm_mq_sendv(mqh, &((shm_mq_iovec) {"n", 2}), 1, false);
-
-			if (resmq != SHM_MQ_SUCCESS)
-				elog(NOTICE, "jsonbd: backend detached early");
-
-			shm_mq_detach(mqh);
-
-			/* mark we need new handle */
-			mqh = NULL;
 		}
+		if (resmq != SHM_MQ_SUCCESS)
+			elog(NOTICE, "jsonbd: backend detached early");
+
+		/* shm_mq_detach(mqh); */
 	}
 
 	elog(LOG, "jsonbd launcher has ended its work");
@@ -679,21 +692,36 @@ jsonbd_worker_main(Datum arg)
 		if (shutdown_requested)
 			break;
 
-		rc = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
-			0, PG_WAIT_EXTENSION);
+		/* Wait to be signalled. */
+		rc = WaitLatch(&worker_state->latch, WL_LATCH_SET | WL_POSTMASTER_DEATH,
+					   0, PG_WAIT_EXTENSION);
 
 		if (rc & WL_POSTMASTER_DEATH)
 			break;
 
-		ResetLatch(&MyProc->procLatch);
+		/* Reset the latch so we don't spin. */
+		ResetLatch(&worker_state->latch);
 
-		if (shm_mq_get_receiver(worker_state->mqin) != MyProc)
+		if (shm_mq_get_sender(worker_state->mqin) == NULL)
+		{
+			CHECK_FOR_INTERRUPTS();
 			continue;
+		}
 
-		Assert(shm_mq_get_sender(worker_state->mqout) == MyProc);
+		if (!shm_mq_get_sender(worker_state->mqout))
+			shm_mq_set_sender(worker_state->mqout, MyProc);
+
+		if (!shm_mq_get_receiver(worker_state->mqin))
+			shm_mq_set_receiver(worker_state->mqin, MyProc);
 
 		mqh = shm_mq_attach(worker_state->mqin, NULL, NULL);
 		resmq = shm_mq_receive(mqh, &nbytes, &data, false);
+
+		if (resmq == SHM_MQ_DETACHED)
+		{
+			shm_mq_detach(mqh);
+			continue;
+		}
 
 		if (resmq == SHM_MQ_SUCCESS)
 		{
@@ -740,7 +768,6 @@ jsonbd_worker_main(Datum arg)
 			}
 
 			shm_mq_detach(mqh);
-			shm_mq_clean_receiver(worker_state->mqin);
 			mqh = shm_mq_attach(worker_state->mqout, NULL, NULL);
 
 			if (iov != NULL)
@@ -751,7 +778,11 @@ jsonbd_worker_main(Datum arg)
 			if (resmq != SHM_MQ_SUCCESS)
 				elog(NOTICE, "jsonbd: backend detached early");
 
-			shm_mq_detach(mqh);
+			/*
+			 * it is not safe call shm_mq_detach here, since mq can be
+			 * already cleared.
+			 * */
+			/* shm_mq_detach(mqh); */
 			MemoryContextReset(worker_context);
 		}
 	}
