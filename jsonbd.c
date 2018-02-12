@@ -304,6 +304,7 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 
 	hdr = shm_toc_lookup(toc, 0, false);
 
+begin:
 	/*
 	 * find some not busy worker,
 	 * the backend can intercept a worker that just started by another
@@ -398,6 +399,17 @@ jsonbd_communicate(shm_mq_iovec *iov, int iov_len,
 
 comm:
 	Assert(wd != NULL);
+	Assert(LWLockHeldByMe(wd->lock));
+
+	/*
+	 * Even if we got the lock it doesn't mean that worker is free,
+	 * so try to set busy flag
+	 */
+	if (!pg_atomic_test_set_flag(&wd->busy))
+	{
+		LWLockRelease(wd->lock);
+		goto begin;
+	}
 
 	detached = false;
 

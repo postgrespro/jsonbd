@@ -30,24 +30,28 @@ def cwd(path):
         os.chdir(curdir)
 
 
-async def insert_data(con, files, table_name, table_name_c):
-    while True:
-        try:
-            filename = files.pop()
+async def insert_data(node, files, table_name, table_name_c):
+    sql = 'insert into {} values ($1)'
+    sql1 = sql.format(table_name)
+    sql2 = sql.format(table_name_c)
+
+    async with node.connect() as con:
+        while True:
+            try:
+                filename = files.pop()
+            except IndexError:
+                break
+
             print(filename)
-        except IndexError:
-            break
 
-        with open(filename, 'r') as f:
-            data = json.load(f)
+            with open(filename, 'r') as f:
+                data = json.load(f)
 
-        if isinstance(data, dict):
-            if 'rounds' in data:
-                for obj in data['rounds']:
-                    sql = 'insert into {} values ($1)'
-                    for i in range(100):
-                        await con.execute(sql.format(table_name), json.dumps(obj))
-                        await con.execute(sql.format(table_name_c), json.dumps(obj))
+            if isinstance(data, dict):
+                if 'rounds' in data:
+                    for obj in data['rounds']:
+                        await con.execute(sql1, json.dumps(obj))
+                        await con.execute(sql2, json.dumps(obj))
 
 
 def main(loop):
@@ -58,8 +62,6 @@ def main(loop):
 
         node.safe_psql('postgres', 'create extension jsonbd')
 
-        connections = [node.connect() for i in range(3)]
-
         for name, root_dir in sources:
             table_name = name
             table_name_c = '%s_c' % name
@@ -68,20 +70,21 @@ def main(loop):
             node.safe_psql('postgres', 'create table %s(a jsonb compression jsonbd)' % table_name_c)
             node.safe_psql('postgres', 'alter table %s alter column a set storage external' % table_name)
 
-            files = []
             with cwd(os.path.abspath(root_dir)):
+                files = []
                 for filename in glob.iglob('**/*.json', recursive=True):
                     if filename == 'package.json':
                         continue
 
                     files.append(filename)
 
-                coroutines = [insert_data(con, files, table_name, table_name_c)
-                        for con in connections]
+                print(len(files))
+                coroutines = [insert_data(node, files, table_name, table_name_c)
+                    for i in range(4)]
                 loop.run_until_complete(asyncio.gather(*coroutines))
 
-                print(node.safe_psql('postgres', "select pg_size_pretty(pg_total_relation_size('%s'))" % table_name))
-                print(node.safe_psql('postgres', "select pg_size_pretty(pg_total_relation_size('%s'))" % table_name_c))
+            print(node.safe_psql('postgres', "select pg_size_pretty(pg_total_relation_size('%s'))" % table_name))
+            print(node.safe_psql('postgres', "select pg_size_pretty(pg_total_relation_size('%s'))" % table_name_c))
 
 
 if __name__ == '__main__':

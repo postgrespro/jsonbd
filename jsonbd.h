@@ -29,6 +29,7 @@ typedef struct jsonbd_shm_worker
 	volatile Oid		dboid;	/* database of the worker */
 	LWLock			   *lock;
 	Latch				latch;
+	pg_atomic_flag		busy;	/* worker is busy */
 } jsonbd_shm_worker;
 
 /* Shared memory structures */

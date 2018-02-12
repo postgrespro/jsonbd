@@ -161,6 +161,7 @@ init_worker(dsm_segment *seg)
 	/* Set launcher free */
 	SetLatch(&hdr->launcher_latch);
 	InitLatch(&worker_state->latch);
+	pg_atomic_init_flag(&worker_state->busy);
 
 	/* make this worker visible in backend cycle */
 	hdr->workers_ready++;
@@ -778,12 +779,9 @@ jsonbd_worker_main(Datum arg)
 			if (resmq != SHM_MQ_SUCCESS)
 				elog(NOTICE, "jsonbd: backend detached early");
 
-			/*
-			 * it is not safe call shm_mq_detach here, since mq can be
-			 * already cleared.
-			 * */
-			/* shm_mq_detach(mqh); */
+			shm_mq_detach(mqh);
 			MemoryContextReset(worker_context);
+			pg_atomic_clear_flag(&worker_state->busy);
 		}
 	}
 
